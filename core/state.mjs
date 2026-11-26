@@ -127,12 +127,12 @@ export function loadHostSession(cwd, { host = null, conversationId = null } = {}
 
 // --- Session Ledger & Lease ---
 
-function sessionLedgerPath(cwd) {
+export function sessionLedgerPath(cwd) {
   return path.join(resolveStateDir(cwd), "sessions.json");
 }
 
 export function loadSessionLedger(cwd) {
-  return readJsonSafe(sessionLedgerPath(cwd), { entries: {}, leases: {} });
+  return readJsonSafe(sessionLedgerPath(cwd), { entries: {}, bySession: {}, leases: {} });
 }
 
 export function recordRoleSession(
@@ -149,7 +149,10 @@ export function recordRoleSession(
     worktreePath = null,
     baseSha = null,
     patchPath = null,
-    finalHeadSha = null
+    patchSha256 = null,
+    deliverableMode = null,
+    finalHeadSha = null,
+    isWriteRun = false
   }
 ) {
   if (!role || !engine || !sessionId) {
@@ -157,11 +160,18 @@ export function recordRoleSession(
   }
   const file = sessionLedgerPath(cwd);
   withFileLockSync(file, () => {
-    const ledger = readJsonSafe(file, { entries: {}, leases: {} });
+    const ledger = readJsonSafe(file, { entries: {}, bySession: {}, leases: {} });
     ledger.entries = ledger.entries || {};
+    ledger.bySession = ledger.bySession || {};
     const key = `${workflowId}::${role}::${engine}`;
-    const prev = ledger.entries[key] || {};
-    ledger.entries[key] = {
+    const byIdKey = `${engine}::${sessionId}`;
+    const existingById = ledger.bySession[byIdKey] || null;
+
+    // Never inherit worktree/patch bindings from a DIFFERENT sessionId under the same key.
+    // On a non-write (readonly) run, preserve existing worktree binding only if it belongs
+    // to this exact (engine, sessionId) so cross-role resume never strips write state.
+    const preserveExistingWrite = !isWriteRun && Boolean(existingById?.hadWorktree);
+    const resolvedEntry = {
       workflowId,
       role,
       engine,
@@ -169,14 +179,19 @@ export function recordRoleSession(
       sessionCwd,
       model,
       effort,
-      worktreeId: worktreeId ?? prev.worktreeId ?? null,
-      worktreePath: worktreePath ?? prev.worktreePath ?? null,
-      baseSha: baseSha ?? prev.baseSha ?? null,
-      patchPath: patchPath ?? prev.patchPath ?? null,
-      finalHeadSha: finalHeadSha ?? prev.finalHeadSha ?? null,
-      hadWorktree: Boolean(worktreePath || patchPath || prev.hadWorktree),
+      worktreeId: isWriteRun ? worktreeId ?? existingById?.worktreeId ?? null : preserveExistingWrite ? existingById.worktreeId ?? null : null,
+      worktreePath: isWriteRun ? worktreePath ?? null : preserveExistingWrite ? existingById.worktreePath ?? null : null,
+      baseSha: isWriteRun ? baseSha ?? existingById?.baseSha ?? null : preserveExistingWrite ? existingById.baseSha ?? null : null,
+      patchPath: isWriteRun ? patchPath ?? null : preserveExistingWrite ? existingById.patchPath ?? null : null,
+      patchSha256: isWriteRun ? patchSha256 ?? null : preserveExistingWrite ? existingById.patchSha256 ?? null : null,
+      deliverableMode: isWriteRun ? deliverableMode ?? null : preserveExistingWrite ? existingById.deliverableMode ?? null : null,
+      finalHeadSha: isWriteRun ? finalHeadSha ?? null : preserveExistingWrite ? existingById.finalHeadSha ?? null : null,
+      hadWorktree: Boolean(isWriteRun || preserveExistingWrite),
       updatedAt: nowIso()
     };
+
+    ledger.entries[key] = resolvedEntry;
+    ledger.bySession[byIdKey] = resolvedEntry;
     writeJsonAtomic(file, ledger);
   });
 }
@@ -199,6 +214,10 @@ export function lookupRoleSession(cwd, { workflowId = "default", role, engine })
 export function lookupSessionById(cwd, { engine, sessionId }) {
   if (!engine || !sessionId) return null;
   const ledger = loadSessionLedger(cwd);
+  const indexed = ledger.bySession?.[`${engine}::${sessionId}`];
+  if (indexed) {
+    return indexed;
+  }
   const matches = Object.values(ledger.entries ?? {})
     .filter((entry) => entry.engine === engine && entry.sessionId === sessionId)
     .sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
@@ -209,19 +228,21 @@ export function acquireSessionLease(cwd, engine, sessionId, ownerId) {
   if (!engine || !sessionId) return true;
   const file = sessionLedgerPath(cwd);
   return withFileLockSync(file, () => {
-    const ledger = readJsonSafe(file, { entries: {}, leases: {} });
+    const ledger = readJsonSafe(file, { entries: {}, bySession: {}, leases: {} });
     ledger.leases = ledger.leases || {};
     const key = `${engine}::${sessionId}`;
     const existing = ledger.leases[key];
     if (existing && existing.ownerId !== ownerId) {
       let alive = false;
-      try {
-        process.kill(existing.pid, 0);
-        alive = true;
-      } catch (e) {
-        alive = e?.code === "EPERM";
+      if (Number.isInteger(existing.pid) && existing.pid > 0) {
+        try {
+          process.kill(existing.pid, 0);
+          alive = true;
+        } catch (e) {
+          alive = e?.code === "EPERM";
+        }
       }
-      if (alive && Date.now() - Date.parse(existing.acquiredAt || 0) < 3600_000) {
+      if (alive) {
         return false;
       }
     }
@@ -451,28 +472,77 @@ function applyPinTransition(pins, record) {
   return next;
 }
 
-export function readActiveBoardPins(cwd, boardId = "default") {
-  const pinsFile = resolveBoardPinsFile(cwd, boardId);
-  if (fs.existsSync(pinsFile)) {
-    const data = readJsonSafe(pinsFile, { boardId, pins: [] });
-    return (Array.isArray(data.pins) ? data.pins : []).filter((p) => p.status === "active");
-  }
-  const boardFile = resolveBoardFile(cwd, boardId);
-  if (!fs.existsSync(boardFile)) {
-    return [];
-  }
-  // Self-heal missing index once from full .jsonl history so early pins are never lost.
+function rebuildPinsFromBoardLocked(boardFile, pinsFile, boardId) {
+  const st = fs.statSync(boardFile);
   const lines = fs.readFileSync(boardFile, "utf8").split(/\r?\n/).filter(Boolean);
   let pins = [];
+  let lastSeq = 0;
   for (const line of lines) {
     try {
       const rec = JSON.parse(line);
       pins = applyPinTransition(pins, rec);
+      if (Number.isFinite(Number(rec.seq))) {
+        lastSeq = Math.max(lastSeq, Number(rec.seq));
+      }
     } catch {
       // Skip malformed line.
     }
   }
-  writeJsonAtomic(pinsFile, { boardId, updatedAt: nowIso(), pins });
+  writeJsonAtomic(pinsFile, { boardId, indexedSeq: lastSeq, logSize: st.size, updatedAt: nowIso(), pins });
+  return pins;
+}
+
+export function readActiveBoardPins(cwd, boardId = "default") {
+  const boardFile = resolveBoardFile(cwd, boardId);
+  if (!fs.existsSync(boardFile)) {
+    return [];
+  }
+  const pinsFile = resolveBoardPinsFile(cwd, boardId);
+  const st = fs.statSync(boardFile);
+  const data = fs.existsSync(pinsFile) ? readJsonSafe(pinsFile, null) : null;
+
+  if (data && Array.isArray(data.pins) && typeof data.logSize === "number") {
+    if (data.logSize === st.size) {
+      return data.pins.filter((p) => p.status === "active");
+    }
+    if (data.logSize >= 0 && data.logSize < st.size) {
+      const deltaSize = st.size - data.logSize;
+      const fd = fs.openSync(boardFile, "r");
+      let tailText = "";
+      try {
+        const buf = Buffer.alloc(deltaSize);
+        const bytesRead = fs.readSync(fd, buf, 0, deltaSize, data.logSize);
+        tailText = buf.slice(0, bytesRead).toString("utf8");
+      } finally {
+        fs.closeSync(fd);
+      }
+      let pins = data.pins.map((p) => ({ ...p }));
+      let parseOk = true;
+      let sawPinChange = false;
+      for (const line of tailText.split(/\r?\n/).filter(Boolean)) {
+        try {
+          const rec = JSON.parse(line);
+          if (isPinTag(rec.tag) || isRetireTag(rec.tag) || rec.supersedes !== undefined) {
+            sawPinChange = true;
+          }
+          pins = applyPinTransition(pins, rec);
+        } catch {
+          parseOk = false;
+          break;
+        }
+      }
+      if (parseOk) {
+        if (sawPinChange || deltaSize > 8192) {
+          const reconciled = withFileLockSync(boardFile, () => rebuildPinsFromBoardLocked(boardFile, pinsFile, boardId));
+          return reconciled.filter((p) => p.status === "active");
+        }
+        return pins.filter((p) => p.status === "active");
+      }
+    }
+  }
+
+  // Missing, corrupt, or out-of-sync index: rebuild strictly under the board lock.
+  const pins = withFileLockSync(boardFile, () => rebuildPinsFromBoardLocked(boardFile, pinsFile, boardId));
   return pins.filter((p) => p.status === "active");
 }
 
@@ -556,27 +626,26 @@ export function postBoardMessage(cwd, boardId = "default", entry = {}) {
       ...(entry.sessionId ? { sessionId: entry.sessionId } : {}),
       ...(entry.model ? { model: entry.model } : {})
     };
+    const oldSize = fs.existsSync(file) ? fs.statSync(file).size : 0;
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     fs.appendFileSync(file, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+    const newSize = fs.statSync(file).size;
 
-    // Keep dedicated active pins index updated atomically alongside the append log.
+    // Keep dedicated active pins index watermark-aligned atomically under the board lock.
     if (isPinTag(record.tag) || isRetireTag(record.tag) || record.supersedes !== undefined) {
-      let existingPins;
-      if (fs.existsSync(pinsFile)) {
-        existingPins = readJsonSafe(pinsFile, { boardId: safeBoardId, pins: [] }).pins;
+      const existingIndex = fs.existsSync(pinsFile) ? readJsonSafe(pinsFile, null) : null;
+      if (existingIndex && Array.isArray(existingIndex.pins) && existingIndex.logSize === oldSize) {
+        const updatedPins = applyPinTransition(existingIndex.pins, record);
+        writeJsonAtomic(pinsFile, {
+          boardId: safeBoardId,
+          indexedSeq: record.seq,
+          logSize: newSize,
+          updatedAt: nowIso(),
+          pins: updatedPins
+        });
       } else {
-        const allLines = fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean);
-        existingPins = [];
-        for (let i = 0; i < allLines.length - 1; i += 1) {
-          try {
-            existingPins = applyPinTransition(existingPins, JSON.parse(allLines[i]));
-          } catch {
-            // Ignore malformed line.
-          }
-        }
+        rebuildPinsFromBoardLocked(file, pinsFile, safeBoardId);
       }
-      const updatedPins = applyPinTransition(existingPins, record);
-      writeJsonAtomic(pinsFile, { boardId: safeBoardId, updatedAt: nowIso(), pins: updatedPins });
     }
     return record;
   });

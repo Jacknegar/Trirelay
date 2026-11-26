@@ -103,12 +103,29 @@ const {
 } = await import("../core/orchestrator.mjs");
 const { resolveRoute } = await import("../core/router.mjs");
 const { buildWorkerResultToHandoff, createHandoffPacket, loadHandoffPacket, renderHandoffMarkdown } = await import("../core/handoff.mjs");
-const { assertPathInside, postBoardMessage, readActiveBoardPins, readBoardPosts, readBoardPostsBySeqs } = await import("../core/state.mjs");
 const {
+  acquireSessionLease,
+  assertPathInside,
+  loadReviewGateState,
+  lookupSessionById,
+  postBoardMessage,
+  readActiveBoardPins,
+  readBoardPosts,
+  readBoardPostsBySeqs,
+  recordRoleSession,
+  releaseSessionLease,
+  resolveBoardFile,
+  resolveBoardPinsFile,
+  sessionLedgerPath,
+  writeJsonAtomic
+} = await import("../core/state.mjs");
+const {
+  applyJobPatch,
   applyWorktreePatch,
   auditFileScope,
   captureWorktreeChanges,
   createIsolatedWorktree,
+  extractPatchTouchedFiles,
   parsePorcelainZ,
   removeIsolatedWorktree
 } = await import("../core/worktree.mjs");
@@ -796,6 +813,83 @@ async function testReleaseGateStateConsistencySuite() {
   assert.ok(r1Replay.output.includes("hasFeature=true"), `Expected patch replay to restore src/feature.txt, got: ${r1Replay.output}`);
   assert.notEqual(r1Replay.worktreePath, r1Turn1.worktreePath);
 
+  // B1: Per-job immutable patches + SHA-256 + apply-time re-audit (resumed job cannot clobber earlier clean job patch)
+  assert.notEqual(r1Turn1.patchPath, r1Turn2.patchPath, "Turn 2 resume must not overwrite Turn 1 patchPath");
+  assert.ok(r1Turn1.patchSha256 && r1Turn2.patchSha256);
+  const applyJob1Check = applyJobPatch(REPO_DIR, { ...r1Turn1, status: "completed" }, { mode: "check" });
+  assert.equal(applyJob1Check.ok, true);
+  assert.throws(
+    () => applyJobPatch(REPO_DIR, { ...r1Turn1, status: "completed", patchSha256: "0".repeat(64) }, { mode: "check" }),
+    /integrity check failed/i
+  );
+  assert.throws(
+    () =>
+      applyJobPatch(
+        REPO_DIR,
+        { ...r1Turn1, status: "completed", forbiddenFiles: ["src/feature.txt"] },
+        { mode: "check" }
+      ),
+    /apply-time scope re-audit/i
+  );
+  assert.ok(extractPatchTouchedFiles(fs.readFileSync(r1Turn1.patchPath, "utf8")).includes("src/feature.txt"));
+
+  // B2: Fresh session under same (workflow, role, engine) does not inherit prior patch/worktree,
+  // old sessionId stays in lookup, cross-role readonly keeps write binding, and live-PID lease never expires early.
+  recordRoleSession(REPO_DIR, {
+    workflowId: "wf-b2",
+    role: "reviewer",
+    engine: "codex",
+    sessionId: "sess-b2-crossrole-rev",
+    worktreeId: "wt-b2",
+    worktreePath: r1Replay.worktreePath,
+    baseSha: r1Turn1.baseSha,
+    patchPath: r1Turn1.patchPath,
+    patchSha256: r1Turn1.patchSha256,
+    finalHeadSha: r1Turn1.finalHeadSha,
+    isWriteRun: true
+  });
+  recordRoleSession(REPO_DIR, {
+    workflowId: "wf-b2",
+    role: "other-role",
+    engine: "codex",
+    sessionId: "sess-b2-crossrole-rev",
+    isWriteRun: false
+  });
+  assert.equal(
+    lookupSessionById(REPO_DIR, { engine: "codex", sessionId: "sess-b2-crossrole-rev" })?.hadWorktree,
+    true,
+    "Cross-role readonly reuse of same sessionId must preserve hadWorktree"
+  );
+  recordRoleSession(REPO_DIR, {
+    workflowId: "wf-b2",
+    role: "reviewer",
+    engine: "codex",
+    sessionId: "sess-b2-fresh",
+    isWriteRun: false
+  });
+  assert.equal(
+    lookupSessionById(REPO_DIR, { engine: "codex", sessionId: "sess-b2-fresh" })?.patchPath,
+    null,
+    "Fresh session must NOT inherit previous session patchPath"
+  );
+  assert.equal(
+    lookupSessionById(REPO_DIR, { engine: "codex", sessionId: "sess-b2-crossrole-rev" })?.sessionId,
+    "sess-b2-crossrole-rev",
+    "Previous sessionId must remain resolvable after new session uses same workflow/role/engine"
+  );
+  assert.equal(acquireSessionLease(REPO_DIR, "codex", "sess-b2-lease", "owner-1"), true);
+  // Backdate acquiredAt by 3 hours while PID is alive -> competing owner must still be blocked
+  const ledgerFileB2 = sessionLedgerPath(REPO_DIR);
+  const ledgerB2 = JSON.parse(fs.readFileSync(ledgerFileB2, "utf8"));
+  ledgerB2.leases["codex::sess-b2-lease"].acquiredAt = new Date(Date.now() - 3 * 3600_000).toISOString();
+  writeJsonAtomic(ledgerFileB2, ledgerB2);
+  assert.equal(
+    acquireSessionLease(REPO_DIR, "codex", "sess-b2-lease", "owner-2"),
+    false,
+    "Live PID lease must remain locked regardless of age"
+  );
+  releaseSessionLease(REPO_DIR, "codex", "sess-b2-lease", "owner-1");
+
   // Fail-closed path: delete both worktree and patch -> explicit error instead of empty fresh worktree
   removeIsolatedWorktree(REPO_DIR, r1Replay.worktreePath);
   if (r1Replay.patchPath && fs.existsSync(r1Replay.patchPath)) fs.unlinkSync(r1Replay.patchPath);
@@ -855,6 +949,56 @@ async function testReleaseGateStateConsistencySuite() {
   assert.ok(!s3Packet.decisionsMade.includes("Use algorithm A"));
   assert.deepEqual(s3Packet.scope.ownedFiles, [], "Stage 3 without ownedFiles must NOT inherit Stage 2 ownedFiles");
 
+  // B3: parentHandoffId inherits forbiddenFiles, rejects missing parent, supports chronological re-adoption,
+  // and keeps byte-0 static prefix identical across differing stage ownedFiles.
+  const b3Parent = createHandoffPacket(REPO_DIR, {
+    workflowId: "wf-b3",
+    goal: "Parent stage",
+    ownedFiles: ["src/**"],
+    forbiddenFiles: ["src/secrets/**"],
+    invariants: ["INV_X"],
+    decisionsMade: ["DEC_OLD"]
+  });
+  const b3Child = createHandoffPacket(REPO_DIR, {
+    workflowId: "wf-b3",
+    parentHandoffId: b3Parent.packet.handoffId,
+    role: "impl",
+    goal: "Child stage",
+    ownedFiles: ["src/other.js"],
+    supersededDecisions: ["DEC_OLD"]
+  });
+  const b3ReAdopt = createHandoffPacket(REPO_DIR, {
+    workflowId: "wf-b3",
+    parentHandoffId: b3Child.packet.handoffId,
+    role: "impl-2",
+    goal: "Stage 3 re-adopt",
+    ownedFiles: ["src/another.js"],
+    decisionsMade: ["DEC_OLD"]
+  });
+  assert.ok(b3Child.packet.scope.forbiddenFiles.includes("src/secrets/**"));
+  assert.equal(auditFileScope(["src/secrets/key.js"], b3Child.packet.scope).length > 0, true);
+  assert.ok(b3ReAdopt.packet.decisionsMade.includes("DEC_OLD"), "Later re-adoption must override earlier tombstone");
+  assert.ok(!b3ReAdopt.packet.supersededDecisions.includes("DEC_OLD"));
+  assert.throws(
+    () => createHandoffPacket(REPO_DIR, { workflowId: "wf-b3", parentHandoffId: "hof-nonexistent-id", goal: "missing" }),
+    /not found/i
+  );
+  const b3Md1 = renderHandoffMarkdown(b3Parent.packet);
+  const b3Md2 = renderHandoffMarkdown(
+    createHandoffPacket(REPO_DIR, {
+      workflowId: "wf-b3",
+      parentHandoffId: b3Parent.packet.handoffId,
+      role: "impl",
+      goal: "Stage B diff ownedFiles",
+      ownedFiles: ["src/different-stage.js"]
+    }).packet
+  );
+  assert.equal(
+    b3Md1.slice(0, b3Md1.indexOf("\n---\n")),
+    b3Md2.slice(0, b3Md2.indexOf("\n---\n")),
+    "Differing stage ownedFiles must NOT break byte-0 static prefix match"
+  );
+
   // R4 (P1 #4): Early-exit EPIPE does not crash host, and orphan grandchild pipe holders die & settle cleanly on timeout
   const epipeRes = await spawnJsonlProcess({
     bin: process.execPath,
@@ -870,7 +1014,7 @@ async function testReleaseGateStateConsistencySuite() {
   const orphanScript =
     "const { spawn } = require('node:child_process'); " +
     "spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: ['ignore', 1, 2] }); " +
-    "process.exit(0);";
+    "setTimeout(() => {}, 30000);";
   const orphanRes = await spawnJsonlProcess({
     bin: process.execPath,
     args: ["-e", orphanScript],
@@ -883,6 +1027,52 @@ async function testReleaseGateStateConsistencySuite() {
   const orphanElapsed = Date.now() - orphanT0;
   assert.equal(orphanRes.timedOut, true);
   assert.ok(orphanElapsed < 3500, `Orphan pipe timeout must converge quickly, took ${orphanElapsed}ms`);
+
+  // B6: Stdio-redirected SIGTERM-ignoring grandchild STILL gets killed via -pid SIGKILL even after leader dies on SIGTERM and pipes close!
+  const detachedPidFile = path.join(TMP_BASE, "b6-grand.pid");
+  const sigIgnoreScript =
+    "const fs = require('node:fs'); const { spawn } = require('node:child_process'); " +
+    `const c = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: 'ignore' }); ` +
+    `fs.writeFileSync(${JSON.stringify(detachedPidFile)}, String(c.pid)); ` +
+    "setInterval(() => {}, 1000);";
+  const b6Res = await spawnJsonlProcess({
+    bin: process.execPath,
+    args: ["-e", sigIgnoreScript],
+    cwd: REPO_DIR,
+    engine: "codex",
+    stdinText: null,
+    timeoutMs: 250,
+    killGraceMs: 200
+  });
+  assert.equal(b6Res.timedOut, true);
+  const grandPid = Number(fs.readFileSync(detachedPidFile, "utf8").trim());
+  assert.ok(grandPid > 0);
+  let grandAlive = true;
+  try {
+    process.kill(grandPid, 0);
+  } catch (e) {
+    if (e.code === "ESRCH") grandAlive = false;
+  }
+  assert.equal(grandAlive, false, `Expected -pid SIGKILL to terminate SIGTERM-ignoring grandchild pid=${grandPid}`);
+
+  // B6 normal-exit orphan drain: CLI exits 0 cleanly while pipe-holder stays alive -> drains & settles with code=0
+  const drainT0 = Date.now();
+  const drainScript =
+    "const { spawn } = require('node:child_process'); " +
+    "spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: ['ignore', 1, 2] }); " +
+    "process.exit(0);";
+  const drainRes = await spawnJsonlProcess({
+    bin: process.execPath,
+    args: ["-e", drainScript],
+    cwd: REPO_DIR,
+    engine: "codex",
+    stdinText: null,
+    timeoutMs: 30000,
+    killGraceMs: 200
+  });
+  assert.equal(drainRes.code, 0);
+  assert.equal(drainRes.timedOut, false);
+  assert.ok(Date.now() - drainT0 < 3000, "Normal exit with orphaned pipe-holder must settle within drain grace");
 
   // R5 (P2 #5): Long 520B pin preserved intact; pin at #1 survives 205 updates; pinsOnly/seqs/supersedes work cleanly
   const r5BoardId = `pins-r5-${Date.now()}`;
@@ -917,6 +1107,48 @@ async function testReleaseGateStateConsistencySuite() {
   assert.equal(seq1Lookup.length, 1);
   assert.ok(seq1Lookup[0].text.includes(longPinTail));
 
+  // B7: Corrupt or out-of-sync .pins.json reconciles automatically from .jsonl on readActiveBoardPins
+  const r5PinsFile = resolveBoardPinsFile(REPO_DIR, r5BoardId);
+  const r5BoardFile = resolveBoardFile(REPO_DIR, r5BoardId);
+  const directResolveRec = {
+    seq: 209,
+    boardId: r5BoardId,
+    timestamp: new Date().toISOString(),
+    author: "arch",
+    tag: "[resolve]",
+    supersedes: "pin-long",
+    text: "Resolved long pin"
+  };
+  fs.appendFileSync(r5BoardFile, `${JSON.stringify(directResolveRec)}\n`, "utf8");
+  assert.equal(readActiveBoardPins(REPO_DIR, r5BoardId).length, 1, "Log tail delta must reconcile out-of-date .pins.json");
+  fs.writeFileSync(r5PinsFile, "{corrupt json", "utf8");
+  assert.equal(readActiveBoardPins(REPO_DIR, r5BoardId).length, 1, "Corrupt .pins.json must rebuild from .jsonl");
+
+  // B5: Stale late review-gate completion cannot reopen passed cycle or corrupt newer cycle; incomplete does not consume round
+  fs.writeFileSync(path.join(REPO_DIR, "src", "auth.js"), "export function login() { return true; }\n");
+  process.env.TRIRELAY_TEST_CLAUDE_FAIL = "1";
+  const incGate = `cycle-inc-${Date.now()}`;
+  const gInc = await runReviewGate(REPO_DIR, { gateKey: incGate, engine: "claude", maxRounds: 2 });
+  assert.equal(gInc.decision, "incomplete");
+  delete process.env.TRIRELAY_TEST_CLAUDE_FAIL;
+  const gAfterInc = await runReviewGate(REPO_DIR, { gateKey: incGate, engine: "claude", maxRounds: 2 });
+  assert.equal(gAfterInc.decision, "pass");
+  assert.equal(gAfterInc.round, 1, "Incomplete run must NOT burn round count");
+
+  const raceGate = `cycle-race-${Date.now()}`;
+  process.env.TRIRELAY_TEST_REVIEW_BLOCKING = "1";
+  process.env.TRIRELAY_TEST_DELAY_MS = "1500";
+  const slowC1 = runReviewGate(REPO_DIR, { gateKey: raceGate, engine: "claude", maxRounds: 2 });
+  await new Promise((r) => setTimeout(r, 150));
+  delete process.env.TRIRELAY_TEST_REVIEW_BLOCKING;
+  delete process.env.TRIRELAY_TEST_DELAY_MS;
+  // Pass cycle 1 via reset+pass -> moves to passed cycle before slowC1 resolves
+  const fastPass = await runReviewGate(REPO_DIR, { gateKey: raceGate, engine: "claude", maxRounds: 2 });
+  assert.equal(fastPass.decision, "pass");
+  const slowDone = await slowC1;
+  assert.equal(slowDone.staleCompletion, true, "Stale completion against closed/passed cycle must be ignored");
+  assert.equal(loadReviewGateState(REPO_DIR, raceGate).status, "passed", "Stale writeback must NOT reopen passed cycle");
+
   // R6 (P2 #6): Review gate opens a fresh cycle after PASS instead of escalating on 3rd approving call
   fs.writeFileSync(path.join(REPO_DIR, "src", "auth.js"), "export function login() { return true; }\n");
   delete process.env.TRIRELAY_TEST_REVIEW_BLOCKING;
@@ -949,6 +1181,25 @@ async function testReleaseGateStateConsistencySuite() {
   assert.equal(ignRes.ignoredOnlyDeliverables, true);
   assert.equal(ignRes.patchPath, null);
   assert.ok(ignRes.worktreePath && fs.existsSync(ignRes.worktreePath), "Ignored-only deliverable must retain worktree");
+  const compactIgn = JSON.parse(
+    serializeMcpPayload("relay_run", { ...ignRes, output: "VERBOSE_IGN ".repeat(1200) }, { maxBytes: 8500 }).text
+  );
+  assert.equal(compactIgn._compacted, true);
+  assert.equal(compactIgn.deliverableMode, "ignored-only");
+  assert.equal(compactIgn.ignoredOnlyDeliverables, true);
+  // Ignored cache files must not cause false ownedFiles scope violation alongside owned tracked changes
+  const wtIgnScope = createIsolatedWorktree(REPO_DIR, { id: `wt-ign-scope-${Date.now()}` });
+  try {
+    fs.writeFileSync(path.join(wtIgnScope.worktreePath, "src", "app.js"), "export const v = 9;\n");
+    fs.mkdirSync(path.join(wtIgnScope.worktreePath, "dist-ignored"), { recursive: true });
+    fs.writeFileSync(path.join(wtIgnScope.worktreePath, "dist-ignored", "cache.bin"), "cached");
+    const capIgnScope = captureWorktreeChanges(REPO_DIR, wtIgnScope.worktreePath, wtIgnScope.worktreeId, wtIgnScope.baseSha);
+    assert.equal(capIgnScope.deliverableMode, "patch");
+    assert.equal(auditFileScope(capIgnScope.changedFiles, { ownedFiles: ["src/**"], forbiddenFiles: ["docs/handoff.md"] }).length, 0);
+    assert.equal(auditFileScope(capIgnScope.ignoredFiles, { ownedFiles: [], forbiddenFiles: ["docs/handoff.md"] }).length, 0);
+  } finally {
+    removeIsolatedWorktree(REPO_DIR, wtIgnScope.worktreePath);
+  }
   removeIsolatedWorktree(REPO_DIR, ignRes.worktreePath);
 
   // R3 (P1 #3) over real MCP server: 12 blocking findings (>32 KB) compact to <=8500B with actionable reviewId,
@@ -1001,7 +1252,11 @@ async function testReleaseGateStateConsistencySuite() {
     assert.equal(parsedRev._compacted, true);
     assert.ok(parsedRev.reviewId, "Compacted review must preserve reviewId");
     assert.equal(parsedRev.blockingCount, 12);
-    assert.ok(Array.isArray(parsedRev.blockingPreview) && parsedRev.blockingPreview.length > 0);
+    assert.ok(
+      (Array.isArray(parsedRev.blockingPreview) && parsedRev.blockingPreview.length > 0) ||
+        (Array.isArray(parsedRev.blockingFindings) && parsedRev.blockingFindings.length === 12),
+      "Compacted review must preserve blockingPreview or full blockingFindings"
+    );
     assert.ok(parsedRev._recall.includes(parsedRev.reviewId) && parsedRev._recall.includes("inspect"));
 
     // Paginate ALL 12 findings via inspect without mutating gate round!
@@ -1037,14 +1292,54 @@ async function testReleaseGateStateConsistencySuite() {
     const round2 = JSON.parse((await waitForId(5)).result.content[0].text);
     assert.equal(round2.round, 2);
 
-    // Check full board view bypasses 100-post window
+    // B4: 3rd call hits escalate_to_user and even with 12 large remainingBlockingFindings preserves reviewId, blockingCount & blockingPreview!
     send({
       jsonrpc: "2.0",
       id: 6,
       method: "tools/call",
+      params: { name: "relay_review_gate", arguments: { cwd: REPO_DIR, gateKey: gateKeyR3, engine: "claude", maxRounds: 2 } }
+    });
+    const escalatedMsg = await waitForId(6);
+    const escText = escalatedMsg.result.content[0].text;
+    assert.ok(Buffer.byteLength(escText, "utf8") <= 8500, "Compacted escalation must stay <=8500B");
+    const escParsed = JSON.parse(escText);
+    assert.equal(escParsed.decision, "escalate_to_user");
+    assert.equal(escParsed.reviewId, round2.reviewId, "Escalation must preserve last reviewId");
+    assert.equal(escParsed.blockingCount, 12);
+    assert.ok(
+      (Array.isArray(escParsed.blockingPreview) && escParsed.blockingPreview.length > 0) ||
+        (Array.isArray(escParsed.remainingBlockingFindings) && escParsed.remainingBlockingFindings.length === 12),
+      "Compacted escalation must preserve blockingPreview or remainingBlockingFindings"
+    );
+    assert.ok(escParsed._recall.includes(round2.reviewId));
+
+    // Also verify tight maxBytes=2200 Pass 3 escalation forces blockingPreview from remainingBlockingFindings
+    const escTight = JSON.parse(serializeMcpPayload("relay_review_gate", {
+      ok: false,
+      reviewId: round2.reviewId,
+      decision: "escalate_to_user",
+      blockingCount: 12,
+      remainingBlockingFindings: Array.from({ length: 12 }, (_, idx) => ({
+        id: `F${idx + 1}`,
+        severity: "blocking",
+        file: `src/f${idx}.js`,
+        line_start: 10 + idx,
+        title: `Blocker ${idx + 1}`,
+        trigger_path: `Path ${idx + 1}`,
+        body: "Long narrative ".repeat(50)
+      }))
+    }, { maxBytes: 2200 }).text);
+    assert.equal(escTight.reviewId, round2.reviewId);
+    assert.ok(Array.isArray(escTight.blockingPreview) && escTight.blockingPreview.length > 0);
+
+    // Check full board view bypasses 100-post window
+    send({
+      jsonrpc: "2.0",
+      id: 7,
+      method: "tools/call",
       params: { name: "relay_board", arguments: { cwd: REPO_DIR, boardId: r5BoardId, action: "read", view: "full" } }
     });
-    const fullBoard = JSON.parse((await waitForId(6)).result.content[0].text);
+    const fullBoard = JSON.parse((await waitForId(7)).result.content[0].text);
     assert.ok(fullBoard.posts.length >= 208, `Expected >=208 posts on view='full', got ${fullBoard.posts.length}`);
   } finally {
     delete process.env.TRIRELAY_TEST_MANY_FINDINGS;

@@ -21,7 +21,7 @@ English · [简体中文](README.zh-CN.md) · [Quick Start](#quick-start) · [Be
 
 | Tiered Board Memory *(v1.1.0 offline)* | Cross-Engine Continuity *(v1.1.0 offline)* | MCP Inline Payload Cap *(v1.1.0 offline)* | SessionStart Hook *(v1.1.0 offline)* |
 | :---: | :---: | :---: | :---: |
-| **-48.4%**<br><sub>`6,405 B → 3,305 B` · `5/5` pins intact</sub> | **100% prefix + chain**<br><sub>`416 B` byte-0 prefix · chained invariants intact</sub> | **0 spills (-96.5%)**<br><sub>`28,203 B → 992 B` · `≤8.5 KB` cap + `blockingPreview`</sub> | **548 ms median** *(447 B)*<br><sub>Git + roles + handoff + pins/stubs</sub> |
+| **-48.4%**<br><sub>`6,405 B → 3,305 B` · `5/5` pins intact</sub> | **100% prefix + chain**<br><sub>`373 B` byte-0 prefix · cross-stage invariants intact</sub> | **-96.4% / -98.5%**<br><sub>`1,018 B` job / `917 B` review (`≤8.8 KB` threshold + `blockingPreview`)</sub> | **623 ms median** *(462 B)*<br><sub>Git + roles + handoff + pins/stubs</sub> |
 
 ---
 
@@ -38,9 +38,9 @@ Most multi-agent bridges either lock one tool in as permanent boss, bloat prompt
    - **Elephant (Trackable Continuity)**: Implementation & multi-turn roles receive **byte-0 prefix-stable** `<HANDOFF_PACKET>` files (`<HANDOFF_CONTRACT>` + pinned invariants before the turn delimiter), **3-tier board views** (*dedicated `.pins.json` active-pin index → 120-char programmatic Stub → explicit omission warnings + paginated/full recall*, zero extra LLM summary calls), chained constraint inheritance (`invariants`, `decisionsMade`, `doNotRelitigate`, `forbiddenFiles`) across pipeline stages, and worktree-bound `resumeRole: true` sessions.
    - **Goldfish (Zero-Context Audit)**: `relay_review`, `relay_review_gate`, and `relay_design(action="start")` run with **0 prior chat history** and **no author defense**—eliminating anchoring bias while cutting input tokens.
 3. **Process & Scope Guardrails**
-   - **Worktree-Isolated Writes (`mode: "write"`) + Resumable Snapshots**: Write workers run inside isolated `git worktree` checkouts, capture uncommitted edits, untracked files, binary diffs, and detached-HEAD commits into `.patch` artifacts (reporting `deliverableMode: "patch" | "ignored-only" | "none"`), audit `ownedFiles`/`forbiddenFiles` (`--no-renames` source+target), and hold edits out of your main tree until `relay_apply(mode="apply")`. Resuming a write session (`resumeRole: true`) rebinds the original worktree (or replays its captured `.patch` onto `baseSha`) and fails closed if unrecoverable.
-   - **Per-Engine Execution Profiles**: Drivers enforce distinct engine tool rules—for example, `claude` workers in `mode: "write"` restrict allowed tools to file editing/reading/search and **disable `Bash`** (`--disallowedTools Bash`), while `codex` runs with workspace-write isolation and `agy` runs with its headless agent permissions.
-   - **Immutable Review Artifacts & Bounded Cycle Gate (`relay_review` / `relay_review_gate`)**: Dual-engine reviews persist full findings under an immutable `reviewId` with zero-cost paginated inspection (`action: "inspect"`), preserve `blockingPreview[]` (`id`, `file`, `line`, `title`, `trigger`) under the `8.5 KB` inline MCP cap, separate `blocking` defects from `advisory` notes, upgrade sensitive paths (`auth`, `billing`, `credentials`, `deploy`, `persistence`, `eval`) to `xhigh`, and manage cycle lifecycles cleanly (`open` -> `passed` -> new cycle) with escalation on round 3+.
+   - **Worktree-Isolated Writes (`mode: "write"`) + Resumable Snapshots**: Write workers run inside isolated `git worktree` checkouts, capture uncommitted edits, untracked files, binary diffs, and detached-HEAD commits into per-job `.patch` artifacts with SHA-256 hashes (reporting `deliverableMode: "patch" | "ignored-only" | "none"`), audit `ownedFiles`/`forbiddenFiles` (`--no-renames` source+target, re-audited on `relay_apply`), and hold edits out of your main tree until `relay_apply(mode="apply")`. Resuming a write session (`resumeRole: true`) rebinds the original worktree (or replays its SHA-256-verified `.patch` onto `baseSha`) and fails closed if unrecoverable.
+   - **Per-Engine Execution Profiles**: Drivers enforce distinct engine tool rules—`claude` in `mode: "write"` restricts allowed tools and disables `Bash` (`--disallowedTools Bash`), so it edits files directly without running shell commands/tests; `codex` runs with `workspace-write` sandbox isolation; `agy` runs with `--mode accept-edits` (no `--sandbox`) in write mode and `--mode plan --sandbox` in readonly mode.
+   - **Write-Once Review Artifacts & Bounded Cycle Gate (`relay_review` / `relay_review_gate`)**: Dual-engine reviews persist full findings as write-once `reviewId` artifacts with zero-cost paginated inspection (`action: "inspect"`), preserve `blockingPreview[]` (`id`, `file`, `line`, `title`, `trigger`) under the `8.5 KB` inline MCP cap, separate `blocking` defects from `advisory` notes, upgrade sensitive paths (`auth`, `billing`, `credentials`, `deploy`, `persistence`, `eval`) to `xhigh`, and manage cycle lifecycles cleanly (`open` -> `passed` -> new cycle) with `cycleId` compare-and-set and escalation on round 3+.
    - **Sealed Dual-Track Design (`relay_design`)**: Keeps the host draft hashed & sealed until the independent advisor finishes, then reveals both with a 4-section merge template.
    - **Spill-Free Bounded Async MCP**: `background: true` + `relay_jobs` avoids 3-minute MCP RPC timeouts; responses over `8.5 KB` compact deterministically with actionable `_recall` pointers (and `allowUnboundedRecall` for explicit `inspect`/`pinsOnly`/`seqs`/`view="full"` requests).
 
@@ -107,7 +107,7 @@ For **Claude Code 2.1.275+** marketplace installs:
 
 ## MCP & CLI Reference
 
-Every MCP tool has 1:1 CLI parity (`./bin/trirelay.mjs <subcommand>`):
+Every core workflow has matching CLI commands (`./bin/trirelay.mjs <subcommand>`, including `--parent-handoff`, `--decision`, `--do-not-relitigate`, `--supersede`, `--deprecate-invariant`, and `--timeout`), while fine-grained JSON schema options live on the MCP surface:
 
 | MCP Tool | CLI Equivalent | Purpose |
 |---|---|---|
@@ -137,10 +137,10 @@ Every MCP tool has 1:1 CLI parity (`./bin/trirelay.mjs <subcommand>`):
 
 ## Benchmarks
 
-Offline metrics (`v1.1.0`) were verified deterministically using `npm run benchmark` (`scripts/benchmark.mjs`). Historical live rows below are **single-run `v1.0.0` observations** recorded locally on Linux x64 (`Node.js v24.15.0`, `claude 2.1.325`, `codex-cli 0.169.1`, `agy 1.5.18`) and are not continuously re-run in CI:
+Offline metrics (`v1.1.0`) were generated locally using `npm run benchmark` (`scripts/benchmark.mjs`, `Node.js v24.15.0`); payload byte checks are deterministic, while hook latencies reflect wall-clock spawns. Historical live rows below are **single-run `v1.0.0` observations** recorded locally on Linux x64 (`Node.js v24.15.0`, `claude 2.1.325`, `codex-cli 0.169.1`, `agy 1.5.18`) and are not continuously re-run in CI:
 
 ```bash
-# Deterministic offline check (~1s, safe for CI)
+# Deterministic byte + local hook offline check (~1s, safe for CI)
 npm run benchmark
 
 # Live multi-engine benchmark inside a disposable /tmp repo
@@ -152,9 +152,12 @@ node ./scripts/benchmark.mjs --live
 | Check | Baseline (Naive) | Trirelay (`v1.1.0`) | Measured Outcome |
 |---|---|---|---|
 | **12-Post Cross-Engine Board** | `6,405 B` full dump | `3,305 B` (Active Pins + Stubs + recall hint) | **`-48.4%` bytes**, **`5/5` pinned `INV_*` intact** |
-| **MCP Inline Cap vs Disk Spill** | `28,203 B` (`>8.8 KB` spill) | `992 B` (`_compacted` + `_recall` + `blockingPreview`) | **`-96.5%` bytes**, **`0` spills** |
-| **Prefix & Multi-Hop Inheritance** | Dynamic ordering / unchained | `416 B` byte-0 static header + chained handoff | **100% byte-0 identical across turns**, **`chainedInheritanceIntact: true`** |
-| **SessionStart Continuity Hook** *(3 runs)* | Manual cold inspection | `548 / 813 / 522 ms` | **`548 ms` median**, **`447 B`** payload |
+| **MCP Job Inline Cap** | `28,233 B` (`>8.8 KB` threshold) | `1,018 B` (`_compacted` + `_recall`) | **`-96.4%` bytes**, stays below `8.8 KB` host threshold |
+| **MCP Review Inline Cap** *(12 findings)* | `59,428 B` (`>8.8 KB` threshold) | `917 B` (`blockingPreview=5` + `inspect` `_recall`) | **`-98.5%` bytes**, below `8.8 KB` threshold with preview |
+| **Byte-0 Prefix & Multi-Hop Chain** | Dynamic / different `ownedFiles` | `373 B` byte-0 static header + chained handoff | **100% byte-0 identical across stages**, **`chainedInheritanceIntact: true`** |
+| **SessionStart Continuity Hook** *(3 runs)* | Manual cold inspection | `623 / 693 / 564 ms` | **`623 ms` median**, **`462 B`** payload |
+
+> Note: "stays below `8.8 KB` threshold" verifies compacted serialized payload size locally rather than measuring a live host UI disk spill.
 
 ### Prior Live Single-Run Observations (`v1.0.0` reference)
 
@@ -183,8 +186,8 @@ Validated against host tooling:
 
 ## Platform & Compatibility Notes
 
-- **Live-tested**: Linux x64 (`Ubuntu`, tested with `Node v24`).
-- **Statically reviewed for macOS**: Uses POSIX `sh` launchers with symlink resolution and Homebrew/nvm/fnm/volta discovery, atomic `mkdir` cross-process locks, and CI matrix verification on `macos-latest` ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), but has not yet been executed directly on local macOS hardware.
+- **Live-tested**: Linux x64 (`Ubuntu`, tested locally on `Node v24.15.0`).
+- **CI & macOS compatibility**: GitHub Actions is configured to run syntax checks and `npm test` on `ubuntu-latest` and `macos-latest` (`Node 20`, `22`) ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). POSIX `sh` launchers and symlink/PATH discovery were statically reviewed for macOS, but have not yet been executed directly on local physical macOS hardware.
 
 ## Acknowledgements
 

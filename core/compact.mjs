@@ -222,7 +222,13 @@ export function buildTieredBoardView(
       return { ...i, entry: e };
     });
     while (active.length > 1 && !fitsBudget(active.map((i) => i.entry))) {
-      active.shift();
+      // Drop transient [blocker] auto-pins before explicit [decision] / [invariant] / [pin] records.
+      const blockerIdx = active.findIndex((i) => String(i.entry?.tag || "") === "[blocker]");
+      if (blockerIdx !== -1) {
+        active.splice(blockerIdx, 1);
+      } else {
+        active.shift();
+      }
     }
     if (active.length === 1 && !fitsBudget(active.map((i) => i.entry))) {
       const e = active[0].entry;
@@ -298,7 +304,7 @@ function buildRecallPointer(toolName, payload) {
 function shrinkBulkyStrings(obj, perFieldBytes, stripStructuredOutput = false) {
   if (!obj || typeof obj !== "object") return obj;
 
-  const stringFields = ["output", "rawOutput", "logTail", "hostDraft", "diff", "contextDigest", "text"];
+  const stringFields = ["output", "rawOutput", "logTail", "hostDraft", "diff", "contextDigest", "text", "body", "trigger_path", "recommendation"];
   for (const field of stringFields) {
     if (typeof obj[field] === "string" && Buffer.byteLength(obj[field], "utf8") > perFieldBytes) {
       obj[field] = truncateWithByteNotice(obj[field], perFieldBytes);
@@ -315,7 +321,7 @@ function shrinkBulkyStrings(obj, perFieldBytes, stripStructuredOutput = false) {
     }
   }
 
-  for (const arrKey of ["reviews", "perspectives", "critiques", "stages", "workers", "posts", "findings", "blockingFindings", "advisoryFindings"]) {
+  for (const arrKey of ["reviews", "perspectives", "critiques", "stages", "workers", "posts", "findings", "blockingFindings", "remainingBlockingFindings", "advisoryFindings"]) {
     if (Array.isArray(obj[arrKey])) {
       for (const item of obj[arrKey]) {
         if (item && typeof item === "object") {
@@ -336,9 +342,11 @@ function isBlockingLike(finding) {
 function buildBlockingPreview(payload, maxItems = 6) {
   const source = Array.isArray(payload?.blockingFindings) && payload.blockingFindings.length
     ? payload.blockingFindings
-    : Array.isArray(payload?.findings)
-      ? payload.findings.filter(isBlockingLike)
-      : [];
+    : Array.isArray(payload?.remainingBlockingFindings) && payload.remainingBlockingFindings.length
+      ? payload.remainingBlockingFindings
+      : Array.isArray(payload?.findings)
+        ? payload.findings.filter(isBlockingLike)
+        : [];
   return source.slice(0, maxItems).map((f, idx) => ({
     id: f.id || `F${idx + 1}`,
     file: sliceUtf8Bytes(String(f.file || "unknown"), 64),
@@ -353,6 +361,10 @@ function buildMinimalSummary(toolName, payload, originalBytes, maxBytes) {
   const rawJobId = payload?.jobId || payload?.job?.id || null;
   const rawHandoffId = payload?.handoffId || payload?.packet?.handoffId || null;
   const rawPatchPath = payload?.patchPath || payload?.job?.patchPath || null;
+  const rawWorktreePath = payload?.worktreePath || payload?.job?.worktreePath || null;
+  const rawDeliverableMode = payload?.deliverableMode || payload?.job?.deliverableMode || null;
+  const rawIgnoredOnly = payload?.ignoredOnlyDeliverables ?? payload?.job?.ignoredOnlyDeliverables;
+  const rawIgnoredFiles = payload?.ignoredFiles || payload?.job?.ignoredFiles;
   const rawReviewId = payload?.reviewId || null;
 
   const totalFindings =
@@ -361,14 +373,18 @@ function buildMinimalSummary(toolName, payload, originalBytes, maxBytes) {
       ? payload.findings.length
       : (Array.isArray(payload?.blockingFindings) || Array.isArray(payload?.advisoryFindings))
         ? (payload?.blockingFindings?.length ?? 0) + (payload?.advisoryFindings?.length ?? 0)
-        : null);
+        : Array.isArray(payload?.remainingBlockingFindings)
+          ? payload.remainingBlockingFindings.length
+          : null);
   const blockingCount =
     payload?.blockingCount ??
     (Array.isArray(payload?.blockingFindings)
       ? payload.blockingFindings.length
-      : Array.isArray(payload?.findings)
-        ? payload.findings.filter(isBlockingLike).length
-        : null);
+      : Array.isArray(payload?.remainingBlockingFindings)
+        ? payload.remainingBlockingFindings.length
+        : Array.isArray(payload?.findings)
+          ? payload.findings.filter(isBlockingLike).length
+          : null);
   const advisoryCount =
     payload?.advisoryCount ??
     (Array.isArray(payload?.advisoryFindings)
@@ -389,6 +405,12 @@ function buildMinimalSummary(toolName, payload, originalBytes, maxBytes) {
     ...(rawJobId ? { jobId: sliceUtf8Bytes(String(rawJobId), 96) } : {}),
     ...(rawHandoffId ? { handoffId: sliceUtf8Bytes(String(rawHandoffId), 96) } : {}),
     ...(rawPatchPath ? { patchPath: truncateWithByteNotice(String(rawPatchPath), Math.min(200, Math.floor(maxBytes / 4))) } : {}),
+    ...(rawWorktreePath ? { worktreePath: truncateWithByteNotice(String(rawWorktreePath), Math.min(200, Math.floor(maxBytes / 4))) } : {}),
+    ...(rawDeliverableMode ? { deliverableMode: sliceUtf8Bytes(String(rawDeliverableMode), 32) } : {}),
+    ...(typeof rawIgnoredOnly === "boolean" ? { ignoredOnlyDeliverables: rawIgnoredOnly } : {}),
+    ...(Array.isArray(rawIgnoredFiles) && rawIgnoredFiles.length
+      ? { ignoredFiles: rawIgnoredFiles.slice(0, 6).map((f) => sliceUtf8Bytes(String(f), 80)) }
+      : {}),
     ...(payload?.verdict ? { verdict: sliceUtf8Bytes(String(payload.verdict), 32) } : {}),
     ...(payload?.decision ? { decision: sliceUtf8Bytes(String(payload.decision), 32) } : {}),
     ...(totalFindings != null ? { totalFindings } : {}),
@@ -422,10 +444,12 @@ function buildMinimalSummary(toolName, payload, originalBytes, maxBytes) {
   }
 
   const dropOrder = [
+    "ignoredFiles",
     "changedFiles",
     "scopeViolations",
     "artifactPath",
     "error",
+    "worktreePath",
     "patchPath",
     "blockingPreview",
     "sessionId",
@@ -435,6 +459,8 @@ function buildMinimalSummary(toolName, payload, originalBytes, maxBytes) {
     "round",
     "durationMs",
     "advisoryCount",
+    "ignoredOnlyDeliverables",
+    "deliverableMode",
     "verdict",
     "decision",
     "status",

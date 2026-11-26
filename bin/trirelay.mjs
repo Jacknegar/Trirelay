@@ -23,7 +23,7 @@ import {
 } from "../core/orchestrator.mjs";
 import { getFullModelCatalog, resolveRoute } from "../core/router.mjs";
 import { postBoardMessage, readActiveBoardPins, readBoardPosts, readBoardPostsBySeqs } from "../core/state.mjs";
-import { applyWorktreePatch } from "../core/worktree.mjs";
+import { applyJobPatch } from "../core/worktree.mjs";
 
 const BOOLEAN_FLAGS = new Set([
   "json",
@@ -54,7 +54,18 @@ const BOOLEAN_FLAGS = new Set([
 function parseArgs(argv) {
   const options = {};
   const positionals = [];
-  const multi = new Set(["model-list", "owned-file", "forbidden-file", "invariant", "criterion", "context"]);
+  const multi = new Set([
+    "model-list",
+    "owned-file",
+    "forbidden-file",
+    "invariant",
+    "decision",
+    "do-not-relitigate",
+    "supersede",
+    "deprecate-invariant",
+    "criterion",
+    "context"
+  ]);
 
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
@@ -228,6 +239,7 @@ async function main() {
         worktree: mode === "write" ? true : Boolean(options.worktree),
         handoff: Boolean(options.handoff),
         handoffId: options["handoff-id"],
+        parentHandoffId: options["parent-handoff"],
         includeHostDigest: Boolean(options["host-digest"]),
         includeRepoHandoff: Boolean(options["repo-handoff"]),
         includeBoardDigest: options["no-board-digest"] ? false : options["board-digest"] ? true : undefined,
@@ -238,6 +250,10 @@ async function main() {
         ownedFiles: options["owned-file"] ?? [],
         forbiddenFiles: options["forbidden-file"] ?? ["docs/handoff.md"],
         invariants: options.invariant ?? [],
+        decisionsMade: options.decision ?? [],
+        doNotRelitigate: options["do-not-relitigate"] ?? [],
+        supersededDecisions: options.supersede ?? [],
+        deprecatedInvariants: options["deprecate-invariant"] ?? [],
         acceptanceCriteria: options.criterion ?? []
       });
       printOutput(asJson ? res : res.output || res.error || "", asJson);
@@ -281,6 +297,7 @@ async function main() {
         scope: options.scope || "auto",
         base: options.base || null,
         effort: options.effort || undefined,
+        timeoutMs: options.timeout ? Number(options.timeout) : undefined,
         focus: positionals.join(" ")
       });
       printOutput(res, true);
@@ -330,6 +347,7 @@ async function main() {
         workflowId: options.workflow,
         models,
         crossCritique: Boolean(options["cross-critique"]),
+        timeoutMs: options.timeout ? Number(options.timeout) : undefined,
         includeHostDigest: Boolean(options["host-digest"]),
         includeRepoHandoff: Boolean(options["repo-handoff"]),
         prompt: options.prompt || positionals.join(" ")
@@ -387,16 +405,7 @@ async function main() {
       const jobId = positionals[0] || options.id;
       if (!jobId) throw new Error("Usage: trirelay apply <jobId> [--mode check|apply]");
       const detail = await handleJobControl(cwd, { action: "result", jobId });
-      const job = detail.job;
-      if (job?.status !== "completed") {
-        throw new Error(`Refusing to apply patch from non-completed job "${jobId}" (status=${job?.status ?? "unknown"}).`);
-      }
-      if (Array.isArray(job?.scopeViolations) && job.scopeViolations.length > 0) {
-        throw new Error(`Refusing to apply patch with scope violation(s): ${job.scopeViolations.join("; ")}`);
-      }
-      const patchPath = job?.patchPath;
-      if (!patchPath) throw new Error(`Job "${jobId}" has no captured patchPath.`);
-      printOutput(applyWorktreePatch(cwd, patchPath, { mode: options.mode || "check" }), true);
+      printOutput(applyJobPatch(cwd, detail.job, { mode: options.mode || "check" }), true);
       break;
     }
 
@@ -406,6 +415,7 @@ async function main() {
         printOutput(
           createHandoffPacket(cwd, {
             workflowId: options.workflow || "default",
+            parentHandoffId: options["parent-handoff"] || null,
             fromHost: options.from || resolveHost(host),
             toEngine: options.to || "codex",
             role: options.role || "worker",
@@ -413,6 +423,10 @@ async function main() {
             ownedFiles: options["owned-file"] ?? [],
             forbiddenFiles: options["forbidden-file"] ?? ["docs/handoff.md"],
             invariants: options.invariant ?? [],
+            decisionsMade: options.decision ?? [],
+            doNotRelitigate: options["do-not-relitigate"] ?? [],
+            supersededDecisions: options.supersede ?? [],
+            deprecatedInvariants: options["deprecate-invariant"] ?? [],
             acceptanceCriteria: options.criterion ?? [],
             includeHostDigest: Boolean(options["host-digest"]),
             includeRepoHandoff: Boolean(options["repo-handoff"]),

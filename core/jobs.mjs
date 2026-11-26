@@ -75,6 +75,12 @@ export function launchBackgroundJob(cwd, meta, asyncRunner) {
         sessionId: result?.sessionId ?? null,
         worktreePath: result?.worktreePath ?? null,
         patchPath: result?.patchPath ?? null,
+        patchSha256: result?.patchSha256 ?? null,
+        deliverableMode: result?.deliverableMode ?? null,
+        ignoredOnlyDeliverables: Boolean(result?.ignoredOnlyDeliverables),
+        ignoredFiles: result?.ignoredFiles ?? [],
+        ownedFiles: result?.ownedFiles ?? [],
+        forbiddenFiles: result?.forbiddenFiles ?? [],
         finalHeadSha: result?.finalHeadSha ?? null,
         changedFiles: result?.changedFiles ?? [],
         scopeViolations: result?.scopeViolations ?? [],
@@ -193,4 +199,20 @@ export async function handleJobControl(cwd, args = {}) {
   }
 
   return { job: detail, logTail };
+}
+
+export async function cancelAllActiveInProcessJobs(graceMs = 1500) {
+  const active = [...activeInProcessJobs.values()];
+  if (active.length === 0) return;
+  for (const item of active) {
+    try {
+      item.controller.abort();
+    } catch {
+      // Ignore abort errors.
+    }
+  }
+  await Promise.race([
+    Promise.allSettled(active.map((a) => a.promise)),
+    new Promise((r) => setTimeout(r, graceMs))
+  ]);
 }

@@ -13,7 +13,7 @@ import {
   resolveWorkspaceRoot
 } from "../core/env.mjs";
 import { createHandoffPacket, listWorkspaceClaudeSessions, loadHandoffPacket } from "../core/handoff.mjs";
-import { handleJobControl, launchBackgroundJob } from "../core/jobs.mjs";
+import { cancelAllActiveInProcessJobs, handleJobControl, launchBackgroundJob } from "../core/jobs.mjs";
 import {
   assertRecursionSafe,
   inspectReviewArtifact,
@@ -34,7 +34,7 @@ import {
   readBoardPostsBySeqs,
   readJsonSafe
 } from "../core/state.mjs";
-import { applyWorktreePatch } from "../core/worktree.mjs";
+import { applyJobPatch } from "../core/worktree.mjs";
 
 const PACKAGE_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const PKG = readJsonSafe(path.join(PACKAGE_ROOT, "package.json"), { version: "1.0.0" });
@@ -178,6 +178,7 @@ const TOOLS = [
         severity: { type: "string" },
         cwd: { type: "string" },
         host: { type: "string", enum: ["agy", "claude", "codex", "cli"] },
+        background: { type: "boolean", default: false },
         gateKey: { type: "string" },
         workflowId: { type: "string" },
         maxRounds: { type: "number", default: 2 },
@@ -260,7 +261,8 @@ const TOOLS = [
         includeHostDigest: { type: "boolean" },
         includeRepoHandoff: { type: "boolean" },
         maxConcurrency: { type: "number" },
-        maxPerEngine: { type: "number" }
+        maxPerEngine: { type: "number" },
+        timeoutMs: { type: "number" }
       }
     }
   },
@@ -330,7 +332,10 @@ const TOOLS = [
         pinsOnly: { type: "boolean", default: false },
         seqs: { type: "array", items: { type: "number" } },
         since: { type: "number", default: 0 },
-        limit: { type: "number", default: 100 },
+        limit: {
+          type: "number",
+          description: "Entry cap (defaults to 100 when view='tiered'; unbounded 0 when view='full')."
+        },
         author: { type: "string" },
         tag: { type: "string" },
         text: { type: "string" },
@@ -492,6 +497,15 @@ async function handleToolCall(name, args = {}) {
       if (args.action === "inspect" || args.reviewId) {
         return inspectReviewArtifact(cwd, args);
       }
+      if (args.background && !args.reset) {
+        assertRecursionSafe(cwd);
+        validateCallerArgs(args);
+        return launchBackgroundJob(
+          cwd,
+          { kind: "review-gate", workflowId: args.gateKey || args.workflowId || "default-gate", role: "reviewer", mode: "readonly" },
+          ({ signal }) => runReviewGate(cwd, args, { signal })
+        );
+      }
       return await runReviewGate(cwd, args);
     }
 
@@ -527,18 +541,7 @@ async function handleToolCall(name, args = {}) {
 
     case "relay_apply": {
       const detail = await handleJobControl(cwd, { action: "result", jobId: args.jobId });
-      const job = detail.job;
-      if (job?.status !== "completed") {
-        throw new Error(`Refusing to apply patch from non-completed job "${args.jobId}" (status=${job?.status ?? "unknown"}).`);
-      }
-      if (Array.isArray(job?.scopeViolations) && job.scopeViolations.length > 0) {
-        throw new Error(`Refusing to apply patch with scope violation(s): ${job.scopeViolations.join("; ")}`);
-      }
-      const patchPath = job?.patchPath;
-      if (!patchPath) {
-        throw new Error(`Job "${args.jobId}" has no captured patchPath.`);
-      }
-      return applyWorktreePatch(cwd, patchPath, { mode: args.mode || "check" });
+      return applyJobPatch(cwd, detail.job, { mode: args.mode || "check" });
     }
 
     case "relay_handoff": {
@@ -660,7 +663,7 @@ async function handleRequest(msg) {
           (toolName === "relay_jobs" && toolArgs.compact === false) ||
           (toolName === "relay_board" && (toolArgs.view === "full" || toolArgs.pinsOnly === true || Array.isArray(toolArgs.seqs))) ||
           ((toolName === "relay_review" || toolName === "relay_review_gate") && (toolArgs.action === "inspect" || Boolean(toolArgs.reviewId))) ||
-          toolName === "relay_handoff";
+          (toolName === "relay_handoff" && toolArgs.action === "inspect");
 
         const serialized = serializeMcpPayload(toolName, payload, {
           maxBytes: resolveMcpMaxBytes(),
@@ -688,6 +691,21 @@ async function handleRequest(msg) {
 
 export function startMcpServer() {
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  let shuttingDown = false;
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void cancelAllActiveInProcessJobs(1500);
+  };
+  rl.on("close", shutdown);
+  process.on("SIGTERM", () => {
+    shutdown();
+    setTimeout(() => process.exit(0), 250).unref?.();
+  });
+  process.on("SIGINT", () => {
+    shutdown();
+    setTimeout(() => process.exit(0), 250).unref?.();
+  });
   rl.on("line", (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;

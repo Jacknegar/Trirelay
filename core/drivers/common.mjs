@@ -86,7 +86,18 @@ export function spawnJsonlProcess({
     let terminating = false;
     let settled = false;
     let forceKillTimer = null;
+    let exitDrainTimer = null;
     let finalSettleTimer = null;
+
+    function isProcessGroupAlive(pid) {
+      if (!useProcessGroup || !pid) return false;
+      try {
+        process.kill(-pid, 0);
+        return true;
+      } catch (e) {
+        return e?.code === "EPERM";
+      }
+    }
 
     function destroyStreams() {
       try { proc.stdin?.destroy(); } catch {}
@@ -94,17 +105,30 @@ export function spawnJsonlProcess({
       try { proc.stderr?.destroy(); } catch {}
     }
 
-    function cleanup() {
-      if (timeoutTimer) clearTimeout(timeoutTimer);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
-      if (finalSettleTimer) clearTimeout(finalSettleTimer);
+    function cleanup(preserveForceKill = false) {
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
+      if (exitDrainTimer) {
+        clearTimeout(exitDrainTimer);
+        exitDrainTimer = null;
+      }
+      if (!preserveForceKill && forceKillTimer) {
+        clearTimeout(forceKillTimer);
+        forceKillTimer = null;
+      }
+      if (finalSettleTimer) {
+        clearTimeout(finalSettleTimer);
+        finalSettleTimer = null;
+      }
       if (signal) signal.removeEventListener("abort", onAbort);
     }
 
     function finalize(codeOverride = undefined) {
       if (settled) return;
       settled = true;
-      cleanup();
+      cleanup(false);
       const tail = stdoutBuf.trim();
       if (tail) {
         onLine?.(tail);
@@ -120,12 +144,18 @@ export function spawnJsonlProcess({
       });
     }
 
-    function terminateTree() {
-      if (terminating || settled) return;
-      terminating = true;
+    function terminateTree({ markTerminating = true } = {}) {
+      if ((terminating && markTerminating) || settled) return;
+      if (markTerminating) {
+        terminating = true;
+      }
+      if (exitDrainTimer) {
+        clearTimeout(exitDrainTimer);
+        exitDrainTimer = null;
+      }
 
       // Signal the entire process group even if the lead CLI already exited while
-      // orphaned descendant workers/tools still hold stdio pipes open.
+      // orphaned descendant workers/tools still hold stdio pipes open or ignore SIGTERM.
       try {
         if (useProcessGroup && proc.pid) {
           process.kill(-proc.pid, "SIGTERM");
@@ -136,35 +166,35 @@ export function spawnJsonlProcess({
         // Ignore ESRCH when process/group already exited.
       }
 
-      forceKillTimer = setTimeout(() => {
-        try {
-          if (useProcessGroup && proc.pid) {
-            process.kill(-proc.pid, "SIGKILL");
-          } else if (!processExited) {
-            proc.kill("SIGKILL");
+      if (!forceKillTimer) {
+        forceKillTimer = setTimeout(() => {
+          forceKillTimer = null;
+          try {
+            if (useProcessGroup && proc.pid) {
+              process.kill(-proc.pid, "SIGKILL");
+            } else if (!processExited) {
+              proc.kill("SIGKILL");
+            }
+          } catch {
+            // Ignore ESRCH.
           }
-        } catch {
-          // Ignore ESRCH.
-        }
-        destroyStreams();
-        finalSettleTimer = setTimeout(() => finalize(exitCode), 250);
-        finalSettleTimer.unref?.();
-      }, graceMs);
-      forceKillTimer.unref?.();
+          destroyStreams();
+          finalSettleTimer = setTimeout(() => finalize(exitCode), 250);
+        }, graceMs);
+      }
     }
 
-    const timeoutTimer =
+    let timeoutTimer =
       timeoutMs > 0
         ? setTimeout(() => {
             timedOut = true;
-            terminateTree();
+            terminateTree({ markTerminating: true });
           }, timeoutMs)
         : null;
-    timeoutTimer?.unref?.();
 
     const onAbort = () => {
       aborted = true;
-      terminateTree();
+      terminateTree({ markTerminating: true });
     };
     if (signal) {
       if (signal.aborted) {
@@ -205,12 +235,22 @@ export function spawnJsonlProcess({
     proc.on("exit", (code) => {
       processExited = true;
       exitCode = code;
+      // If a CLI exits cleanly while orphaned descendants still hold stdout/stderr open,
+      // drain briefly then sweep the process group so we settle with the real exit code instead of hanging.
+      if (!terminating && !settled && !exitDrainTimer) {
+        exitDrainTimer = setTimeout(() => {
+          exitDrainTimer = null;
+          if (!settled) {
+            terminateTree({ markTerminating: false });
+          }
+        }, graceMs);
+      }
     });
 
     proc.on("error", (err) => {
       if (settled) return;
       settled = true;
-      cleanup();
+      cleanup(false);
       resolve({
         code: null,
         spawnError: err,
@@ -223,6 +263,11 @@ export function spawnJsonlProcess({
     });
 
     proc.on("close", (code) => {
+      // Do NOT cancel SIGKILL escalation simply because pipes closed after the leader exited
+      // if grandchildren in the detached process group are still alive.
+      if (terminating && useProcessGroup && proc.pid && forceKillTimer && isProcessGroupAlive(proc.pid)) {
+        return;
+      }
       finalize(code ?? exitCode);
     });
 

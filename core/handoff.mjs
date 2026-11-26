@@ -128,7 +128,12 @@ function collectParentChain(workspaceRoot, parentHandoffId, maxDepth = 20) {
   while (cursor && !visited.has(cursor) && chain.length < maxDepth) {
     visited.add(cursor);
     const parent = loadHandoffPacket(workspaceRoot, cursor);
-    if (!parent) break;
+    if (!parent) {
+      if (chain.length === 0 && cursor === parentHandoffId) {
+        throw new Error(`Parent handoff packet "${parentHandoffId}" not found.`);
+      }
+      break;
+    }
     chain.unshift(parent); // oldest ancestor first
     cursor = parent.parentHandoffId ?? null;
   }
@@ -137,43 +142,47 @@ function collectParentChain(workspaceRoot, parentHandoffId, maxDepth = 20) {
 
 /**
  * Inherit workflow-persistent constraints (invariants, decisionsMade, doNotRelitigate,
- * acceptanceCriteria, verification, forbiddenFiles) across a handoff parent chain while
- * NEVER copying stage-local scope (`ownedFiles`, `role`, `toEngine`, `goal`).
+ * acceptanceCriteria, verification, forbiddenFiles) chronologically across a handoff
+ * parent chain while NEVER copying stage-local scope (`ownedFiles`, `role`, `toEngine`, `goal`).
  */
 export function resolveInheritedConstraints(workspaceRoot, parentHandoffId, input = {}) {
   const chain = parentHandoffId && input.inheritParent !== false
     ? collectParentChain(workspaceRoot, parentHandoffId)
     : [];
 
-  const supAll = new Set(
-    dedupeStrings([
-      ...chain.flatMap((p) => p.supersededDecisions ?? []),
-      ...(input.supersededDecisions ?? [])
-    ])
-  );
-  const depInvAll = new Set(
-    dedupeStrings([
-      ...chain.flatMap((p) => p.deprecatedInvariants ?? []),
-      ...(input.deprecatedInvariants ?? [])
-    ])
-  );
+  const invSet = new Set();
+  const decSet = new Set();
+  const dnrSet = new Set();
+  const supAll = new Set();
+  const depInvAll = new Set();
 
-  const rawInvariants = dedupeStrings([
-    ...chain.flatMap((p) => p.invariants ?? []),
-    ...(input.invariants ?? [])
-  ]);
-  const rawDecisions = dedupeStrings([
-    ...chain.flatMap((p) => p.decisionsMade ?? []),
-    ...(input.decisionsMade ?? [])
-  ]);
-  const rawDoNotRelitigate = dedupeStrings([
-    ...chain.flatMap((p) => p.doNotRelitigate ?? []),
-    ...(input.doNotRelitigate ?? [])
-  ]);
+  for (const hop of [...chain, input]) {
+    for (const sup of dedupeStrings(hop.supersededDecisions ?? [])) {
+      supAll.add(sup);
+      decSet.delete(sup);
+      dnrSet.delete(sup);
+    }
+    for (const dep of dedupeStrings(hop.deprecatedInvariants ?? [])) {
+      depInvAll.add(dep);
+      invSet.delete(dep);
+    }
+    for (const inv of dedupeStrings(hop.invariants ?? [])) {
+      depInvAll.delete(inv);
+      invSet.add(inv);
+    }
+    for (const dec of dedupeStrings(hop.decisionsMade ?? [])) {
+      supAll.delete(dec);
+      decSet.add(dec);
+    }
+    for (const dnr of dedupeStrings(hop.doNotRelitigate ?? [])) {
+      supAll.delete(dnr);
+      dnrSet.add(dnr);
+    }
+  }
 
-  const invariants = rawInvariants.filter((v) => !depInvAll.has(v));
-  const decisionsMade = rawDecisions.filter((v) => !supAll.has(v));
-  const doNotRelitigate = rawDoNotRelitigate.filter((v) => !supAll.has(v));
+  const invariants = [...invSet];
+  const decisionsMade = [...decSet];
+  const doNotRelitigate = [...dnrSet];
   const acceptanceCriteria = dedupeStrings([
     ...chain.flatMap((p) => p.acceptanceCriteria ?? []),
     ...(input.acceptanceCriteria ?? [])
@@ -338,9 +347,6 @@ export function renderHandoffMarkdown(packet) {
     `Return Contract: ${packet.returnContract}`
   ];
 
-  if (packet.scope?.ownedFiles?.length) {
-    lines.push(`Owned Files (you may edit): ${packet.scope.ownedFiles.join(", ")}`);
-  }
   if (packet.scope?.forbiddenFiles?.length) {
     lines.push(`Forbidden Files (DO NOT edit): ${packet.scope.forbiddenFiles.join(", ")}`);
   }
@@ -361,6 +367,9 @@ export function renderHandoffMarkdown(packet) {
   lines.push(
     `<HANDOFF_TURN id="${packet.handoffId}" parent="${packet.parentHandoffId ?? "none"}" version="${packet.decisionVersion ?? 1}" fromHost="${packet.fromHost || packet.fromEngine}" from="${packet.fromEngine}" to="${packet.toEngine}" role="${packet.role}">`
   );
+  if (packet.scope?.ownedFiles?.length) {
+    lines.push(`Owned Files (you may edit): ${packet.scope.ownedFiles.join(", ")}`);
+  }
   if (packet.scope?.worktreePath) {
     lines.push(`Working Directory (Isolated Worktree): ${packet.scope.worktreePath}`);
   }

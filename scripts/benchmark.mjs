@@ -141,14 +141,15 @@ function runMemoryAndHookBenchmark() {
     boardId,
     includeBoardDigest: true,
     goal: "Implement discount clamp",
-    ownedFiles: ["src/billing.js"],
+    ownedFiles: ["src/discount.js"],
     invariants,
     doNotRelitigate: ["Use integer cents arithmetic"],
     contextDigest: "Turn 2 updated dynamic traceback ".repeat(25)
   });
   const md1 = renderHandoffMarkdown(p1);
   const md2 = renderHandoffMarkdown(p2);
-  // Measure strictly from byte 0 up to the `---` separator before dynamic HANDOFF_TURN metadata.
+  // Measure strictly from byte 0 up to the `---` separator before dynamic HANDOFF_TURN
+  // metadata, across turns with DIFFERENT stage-local ownedFiles.
   const splitIdx1 = md1.indexOf("\n---\n");
   const splitIdx2 = md2.indexOf("\n---\n");
   const byte0Prefix1 = md1.slice(0, splitIdx1);
@@ -189,10 +190,11 @@ function runMemoryAndHookBenchmark() {
     !chain3.packet.decisionsMade.includes("LEGACY_ALGO_V1") &&
     chain3.packet.scope.ownedFiles.length === 0;
 
-  // Verify <= 8.5 KB inline MCP compaction prevents Antigravity >8.8 KB disk spills
+  // Verify <= 8.5 KB inline MCP compaction prevents payloads exceeding the 8.8 KB host threshold
   const simulatedRawResult = {
     ok: true,
     jobId: "run-bench-001",
+    deliverableMode: "patch",
     patchPath: path.join(STATE_DIR, "patches", "sample.patch"),
     changedFiles: ["src/billing.js"],
     scopeViolations: [],
@@ -201,6 +203,32 @@ function runMemoryAndHookBenchmark() {
   const naiveMcpBytes = Buffer.byteLength(JSON.stringify(simulatedRawResult, null, 2), "utf8");
   const compactedMcp = serializeMcpPayload("relay_jobs", simulatedRawResult, { maxBytes: 8500 });
   const mcpBytesSavedPct = Number((((naiveMcpBytes - compactedMcp.bytes) / naiveMcpBytes) * 100).toFixed(1));
+
+  // Verify review compaction preserves blockingPreview + reviewId inspect pointer on 12 findings
+  const simulatedReviewPayload = {
+    ok: false,
+    reviewId: "rev-bench-001",
+    verdict: "needs-attention",
+    totalFindings: 12,
+    blockingCount: 12,
+    advisoryCount: 0,
+    blockingFindings: Array.from({ length: 12 }, (_, idx) => ({
+      id: `F${idx + 1}`,
+      severity: "blocking",
+      file: `src/module_${idx + 1}.js`,
+      line_start: 10 + idx,
+      title: `Blocking issue ${idx + 1}`,
+      trigger_path: `Call path ${idx + 1} with nested validation bypass`,
+      body: "Detailed finding narrative ".repeat(80),
+      recommendation: "Enforce invariant before persisting state."
+    })),
+    findings: []
+  };
+  simulatedReviewPayload.findings = simulatedReviewPayload.blockingFindings;
+  const naiveReviewBytes = Buffer.byteLength(JSON.stringify(simulatedReviewPayload, null, 2), "utf8");
+  const compactedReview = serializeMcpPayload("relay_review", simulatedReviewPayload, { maxBytes: 8500 });
+  const compactedReviewParsed = JSON.parse(compactedReview.text);
+  const reviewBytesSavedPct = Number((((naiveReviewBytes - compactedReview.bytes) / naiveReviewBytes) * 100).toFixed(1));
 
   // Measure SessionStart hook latency & snapshot size
   const hookScript = path.join(PACKAGE_ROOT, "scripts", "session-hook.mjs");
@@ -237,8 +265,18 @@ function runMemoryAndHookBenchmark() {
       naiveBytes: naiveMcpBytes,
       compactedBytes: compactedMcp.bytes,
       reductionPct: mcpBytesSavedPct,
+      below8800Threshold: compactedMcp.bytes <= 8800,
       exceeds8800Naive: naiveMcpBytes > 8800,
       exceeds8800Compacted: compactedMcp.bytes > 8800
+    },
+    mcpReviewCap: {
+      findingsTotal: 12,
+      naiveBytes: naiveReviewBytes,
+      compactedBytes: compactedReview.bytes,
+      reductionPct: reviewBytesSavedPct,
+      blockingPreviewCount: compactedReviewParsed.blockingPreview?.length ?? 0,
+      hasInspectRecall: String(compactedReviewParsed._recall || "").includes('action="inspect"'),
+      below8800Threshold: compactedReview.bytes <= 8800
     },
     sessionStartHook: {
       runsMs: hookLatencies,
@@ -453,7 +491,10 @@ async function main() {
       `[Memory] Byte-0 Static Prefix: ${memory.prefixCache.byte0StableHeaderBytes}B, identicalFromByte0=${memory.prefixCache.identicalFromByte0AcrossTurns}, chainedInheritanceIntact=${memory.prefixCache.chainedInheritanceIntact}`
     );
     console.log(
-      `[Spills] MCP Inline Cap: ${memory.mcpInlineCap.naiveBytes}B -> ${memory.mcpInlineCap.compactedBytes}B (-${memory.mcpInlineCap.reductionPct}%), >8.8KB spills=${memory.mcpInlineCap.exceeds8800Compacted ? 1 : 0}`
+      `[Cap]    MCP Job Inline Cap: ${memory.mcpInlineCap.naiveBytes}B -> ${memory.mcpInlineCap.compactedBytes}B (-${memory.mcpInlineCap.reductionPct}%), <=8.8KB=${memory.mcpInlineCap.below8800Threshold}`
+    );
+    console.log(
+      `[Cap]    MCP Review Cap (12 findings): ${memory.mcpReviewCap.naiveBytes}B -> ${memory.mcpReviewCap.compactedBytes}B (-${memory.mcpReviewCap.reductionPct}%), blockingPreview=${memory.mcpReviewCap.blockingPreviewCount}, inspectRecall=${memory.mcpReviewCap.hasInspectRecall}`
     );
     console.log(
       `[Hook]   SessionStart Snapshot: median ${memory.sessionStartHook.medianMs}ms (${memory.sessionStartHook.snapshotBytes}B)`

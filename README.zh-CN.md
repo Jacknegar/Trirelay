@@ -21,7 +21,7 @@
 
 | 三层看板记忆 *(v1.1.0 离线)* | 跨端前缀与继承 *(v1.1.0 离线)* | MCP 内联防溢盘 *(v1.1.0 离线)* | SessionStart 快照 *(v1.1.0 离线)* |
 | :---: | :---: | :---: | :---: |
-| **-48.4%**<br><sub>`6,405 B → 3,305 B` · `5/5` 置顶约束完整</sub> | **前缀 + 链路 100%**<br><sub>`416 B` byte-0 静态前缀 · 多跳不变量保留</sub> | **0 次溢盘 (-96.5%)**<br><sub>`28,203 B → 992 B` · `≤8.5 KB` 保留 `blockingPreview`</sub> | **548 ms 中位** *(447 B)*<br><sub>Git + 可续跑角色 + 交接 + 置顶/Stub</sub> |
+| **-48.4%**<br><sub>`6,405 B → 3,305 B` · `5/5` 置顶约束完整</sub> | **前缀 + 链路 100%**<br><sub>`373 B` byte-0 静态前缀 · 跨阶段不变量保留</sub> | **-96.4% / -98.5%**<br><sub>任务 `1,018 B` / 审查 `917 B`（低于 `8.8 KB` 阈值 + `blockingPreview`）</sub> | **623 ms 中位** *(462 B)*<br><sub>Git + 可续跑角色 + 交接 + 置顶/Stub</sub> |
 
 ---
 
@@ -36,9 +36,9 @@
    - **大象路径（可续跑连续性）**：采用 **Byte-0 Prefix-Cache 排序**（静态 `<HANDOFF_CONTRACT>` 与固定约束置顶于分隔线之前，动态轮次上下文置底）、**三层看板索引**（*独立 `.pins.json` 置顶约束索引 → 120 字程序化 Stub → 省略告警与按序号/`view="full"` 召回*，零 LLM 二次摘要费用）、流水线 `parentHandoffId` 多跳约束继承（`invariants`、`decisionsMade`、`doNotRelitigate`、`forbiddenFiles` 及显式废弃标记）以及绑定 Worktree 的 `resumeRole: true` 增量续跑。
    - **金鱼路径（零历史抗锚定审查）**：`relay_review`、`relay_review_gate`、`relay_design(action="start")` 强制只接收原始需求或代码 diff，不看作者辩护和聊天历史，既防止锚定偏见，又大幅削减输入 Token。
 3. **流程与作用域护栏（不只靠提示词）**
-   - **写操作隔离 `git worktree` + 可恢复快照**：所有 `mode: "write"` 任务都在独立 Worktree 中执行，捕获未暂存修改、未跟踪文件、二进制与脱离 HEAD 的提交为 `.patch`（显式标注 `deliverableMode: "patch" | "ignored-only" | "none"`），并按 `--no-renames` 双向审计 `ownedFiles`/`forbiddenFiles`；未人工确认 `relay_apply(mode="apply")` 前绝不污染主工作区。`resumeRole: true` 续跑写角色时会重新绑定原 worktree 或将其 `.patch` 重放至 `baseSha`，无法恢复时直接报错失败。
-   - **三端执行权限差异透明**：驱动按宿主能力与安全边界实施差异化控制——例如 `claude` 在 `mode: "write"` 下仅放行读写检索工具并**禁用 `Bash`**（`--disallowedTools Bash`），`codex` 使用 workspace-write 沙盒，`agy` 使用无头代理权限。
-   - **不可变审查产物与周期化门禁（`relay_review` / `relay_review_gate`）**：双引擎审查结果持久化为不可变 `reviewId` 产物，支持零开销分页检视（`action: "inspect"`）；超过 `8.5 KB` 压缩阈值时仍保留 `blockingPreview[]`（`id`、`file`、`line`、`title`、`trigger`）；门禁显式区分 `blocking` 与 `advisory`，对敏感路径自动升 `xhigh`，并在通过后关闭当前周期以免后续无关审查误触发第 3 轮升级。
+   - **写操作隔离 `git worktree` + 可恢复快照**：所有 `mode: "write"` 任务都在独立 Worktree 中执行，按独立任务捕获未暂存修改、未跟踪文件、二进制与脱离 HEAD 的提交为 `patches/<jobId>.patch` 并记录 SHA-256（显式标注 `deliverableMode: "patch" | "ignored-only" | "none"`），按 `--no-renames` 双向审计 `ownedFiles`/`forbiddenFiles`（并在 `relay_apply` 时二次校验哈希与范围）；未人工确认 `relay_apply(mode="apply")` 前绝不污染主工作区。`resumeRole: true` 续跑写角色时会重新绑定原 worktree 或将经校验的 `.patch` 重放至 `baseSha`，无法恢复时直接报错失败。
+   - **三端执行权限差异透明**：驱动按宿主能力与安全边界实施差异化控制——`claude` 在 `mode: "write"` 下仅放行读写检索工具并**禁用 `Bash`**（`--disallowedTools Bash`），无法直接运行测试命令；`codex` 使用 `workspace-write` 沙盒；`agy` 在 write 模式下传入 `--mode accept-edits`（不带 `--sandbox`），在 readonly 模式下传入 `--mode plan --sandbox`。
+   - **只写一次审查产物与周期化门禁（`relay_review` / `relay_review_gate`）**：双引擎审查结果持久化为写入后即只读的 `reviewId` 产物，支持零开销分页检视（`action: "inspect"`）；超过 `8.5 KB` 压缩阈值时仍保留 `blockingPreview[]`（`id`、`file`、`line`、`title`、`trigger`）；门禁显式区分 `blocking` 与 `advisory`，对敏感路径自动升 `xhigh`，并在写回时执行 `cycleId` compare-and-set，通过后关闭当前周期以免后续无关审查误触发第 3 轮升级。
    - **双轨盲审设计（`relay_design`）**：先由独立顾问完成方案并封存，宿主再提交己方草案哈希后解锁四段式对照综合。
    - **异步有界 MCP（`≤8.5 KB`）**：支持 `background: true` + `relay_jobs` 避开 3 分钟超时；大输出自动压缩并附带可执行的 `_recall` 指针（显式传入 `inspect`/`pinsOnly`/`seqs`/`view="full"` 时放行全量召回）。
 
@@ -79,7 +79,7 @@ Claude Code 2.1.275+ 市场安装语法：
 
 ## MCP 与 CLI 对照表
 
-所有 MCP 工具与 CLI（`./bin/trirelay.mjs`）100% 功能对等：
+所有核心工作流在 CLI（`./bin/trirelay.mjs`，含 `--parent-handoff`、`--decision`、`--do-not-relitigate`、`--supersede`、`--deprecate-invariant`、`--timeout`）与 MCP 间保持一致；细粒度结构化参数以 MCP Schema 为准：
 
 | MCP 工具 | CLI 命令 | 说明 |
 |---|---|---|
@@ -101,10 +101,10 @@ Claude Code 2.1.275+ 市场安装语法：
 
 ## 实测基准
 
-以下离线指标来自 `v1.1.0` 本地 [`scripts/benchmark.mjs`](scripts/benchmark.mjs) 的确定性验证；下方历史在线对比项为 `v1.0.0` 在 **Linux x64 (`Node.js v24.15.0`)**、**`claude 2.1.325`**、**`codex-cli 0.169.1`**、**`agy 1.5.18`** 上的单次真实记录，不随每次离线检查自动重跑：
+以下离线指标来自 `v1.1.0` 本地 [`scripts/benchmark.mjs`](scripts/benchmark.mjs)（`Node.js v24.15.0`），其中字节数为确定性校验，Hook 耗时为本机真实拉起测量；下方历史在线对比项为 `v1.0.0` 在 **Linux x64 (`Node.js v24.15.0`)**、**`claude 2.1.325`**、**`codex-cli 0.169.1`**、**`agy 1.5.18`** 上的单次真实记录，不随每次离线检查自动重跑：
 
 ```bash
-# 离线确定性验证（约 1 秒，适合 CI）
+# 离线组件校验（约 1 秒，适合 CI）
 npm run benchmark
 
 # 临时 /tmp 仓库中的三端真机对比测试
@@ -116,9 +116,12 @@ node ./scripts/benchmark.mjs --live
 | 对比项目 | 基线 / 朴素做法 | Trirelay 方案 (`v1.1.0`) | 实测结果 |
 |---|---|---|---|
 | **12 条跨端协作看板** | `6,405 B` 全量平铺 | `3,305 B`（活跃置顶索引 + Stub + 召回提示） | **体积下降 `48.4%`**，**`5/5` 关键约束完整** |
-| **MCP 防溢盘压缩** | `28,203 B`（超过 `8.8 KB` 触发溢盘） | `992 B`（`_compacted` + `_recall` + `blockingPreview`） | **体积下降 `96.5%`**，**`0` 次溢盘** |
-| **Byte-0 前缀与链式继承** | 动态混排 / 无继承 | `416 B` byte-0 静态前缀 + 多跳继承链 | **跨轮次 byte-0 100% 一致**，**`chainedInheritanceIntact: true`** |
-| **SessionStart 启动注入** *(3 次)* | 人工冷探索 | `548 / 813 / 522 ms` | **中位 `548 ms`**，快照仅 **`447 B`** |
+| **MCP 任务载荷压缩** | `28,233 B`（高于 `8.8 KB` 阈值） | `1,018 B`（`_compacted` + `_recall`） | **体积下降 `96.4%`**，低于 `8.8 KB` 宿主阈值 |
+| **MCP 审查载荷压缩** *(12 条)* | `59,428 B`（高于 `8.8 KB` 阈值） | `917 B`（`blockingPreview=5` + `inspect` `_recall`） | **体积下降 `98.5%`**，保留前 5 阻断摘要且低于阈值 |
+| **Byte-0 前缀与链式继承** | 动态混排 / 阶段 `ownedFiles` 不同 | `373 B` byte-0 静态前缀 + 多跳继承链 | **跨阶段 byte-0 100% 一致**，**`chainedInheritanceIntact: true`** |
+| **SessionStart 启动注入** *(3 次)* | 人工冷探索 | `623 / 693 / 564 ms` | **中位 `623 ms`**，快照仅 **`462 B`** |
+
+> 说明：“低于 `8.8 KB` 宿主阈值”验证的是本地序列化载荷体积满足上限，并非宿主实机 UI 溢盘抓包。
 
 ### 历史单次实机记录（`v1.0.0` 参考）
 
@@ -135,8 +138,8 @@ node ./scripts/benchmark.mjs --live
 
 ## 平台兼容说明
 
-- **实机验证**：Linux x64（`Node v24`），已通过 16 组全量测试（含 R1–R7 闭环回归，[`test/run-tests.mjs`](test/run-tests.mjs)）、`agy plugin validate`（0 错误）和 `claude plugin validate --strict`（`success: true`，0 错误 0 警告）。
-- **macOS 静态审计**：遵循 POSIX `sh`（含软链解析与 Homebrew/nvm/fnm/volta 路径发现）及标准 Node API，并在 CI 配置 `macos-latest`，但尚未在物理 macOS 机器上本地实机运行。
+- **实机验证**：Linux x64（本地测试环境 `Node v24.15.0`），已通过 16 组全量测试（含 R1–R7 与 B1–B7 闭环回归，[`test/run-tests.mjs`](test/run-tests.mjs)）、`agy plugin validate`（0 错误）和 `claude plugin validate --strict`（`success: true`，0 错误 0 警告）。
+- **CI 与 macOS 兼容说明**：GitHub Actions 已配置 `ubuntu-latest` 与 `macos-latest`（`Node 20` / `22`）工作流（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）；POSIX `sh`（含软链解析与 Homebrew/nvm/fnm/volta 路径发现）与标准 Node API 已做静态核对，但尚未在本地物理 macOS 硬件上实机执行。
 
 ## 致谢
 
