@@ -1,0 +1,26 @@
+{
+  "title": "TrirelayCopyReview",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "rows"],
+  "properties": {
+    "summary": { "type": "string" },
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["location", "current", "problem", "suggestion"],
+        "properties": {
+          "location": { "type": "string" },
+          "current": { "type": "string" },
+          "problem": { "type": "string" },
+          "suggestion": {
+            "type": "string",
+            "description": "Keep status labels concise (2-4 characters/words); move explanatory copy into helper text and trim filler."
+          }
+        }
+      }
+    }
+  }
+}

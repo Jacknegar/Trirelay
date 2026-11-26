@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "trirelay": {
+      "command": "sh",
+      "args": ["./scripts/mcp-launcher.sh"],
+      "tools": {
+        "relay_setup": { "eager": true },
+        "relay_run": { "eager": true },
+        "relay_review_gate": { "eager": true },
+        "relay_design": { "eager": true },
+        "relay_handoff": { "eager": true },
+        "relay_board": { "eager": true },
+        "relay_jobs": { "eager": true }
+      }
+    }
+  }
+}

@@ -1,0 +1,51 @@
+name: Trirelay CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node-version: ["20", "22"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Syntax check (.mjs & .sh)
+        run: |
+          npm run check
+          sh -n scripts/mcp-launcher.sh
+          sh -n scripts/hook-launcher.sh
+          sh -n scripts/install.sh
+      - name: Validate JSON manifests & schemas
+        run: |
+          node -e '
+            const fs = require("fs");
+            const files = [
+              "package.json",
+              "tsconfig.json",
+              "plugin.json",
+              "mcp_config.json",
+              "hooks.json",
+              ".claude-plugin/plugin.json",
+              ".codex-plugin/plugin.json",
+              ".mcp.json",
+              "hooks/hooks.json",
+              "config/routing.json",
+              "schemas/handoff-packet.schema.json",
+              "schemas/worker-result.schema.json",
+              "schemas/review-output.schema.json",
+              "schemas/copy-review.schema.json"
+            ];
+            for (const f of files) JSON.parse(fs.readFileSync(f, "utf8"));
+            console.log("All", files.length, "JSON files valid.");
+          '
+      - name: Run unit & integration test suite
+        run: npm test

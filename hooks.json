@@ -1,0 +1,11 @@
+{
+  "trirelay-session": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "sh ./scripts/hook-launcher.sh",
+        "timeout": 5
+      }
+    ]
+  }
+}

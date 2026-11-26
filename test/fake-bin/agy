@@ -1,0 +1,66 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+
+const args = process.argv.slice(2);
+if (args[0] === "--help") {
+  console.log("fake agy 1.0.0");
+  process.exit(0);
+}
+if (args[0] === "models") {
+  console.log("Fetching available models...");
+  console.log("gemini-4-neon-high\tGemini 4 Neon (High)");
+  console.log("gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)");
+  process.exit(0);
+}
+
+const recordFile = process.env.TRIRELAY_TEST_RECORD_FILE;
+if (recordFile) {
+  fs.appendFileSync(
+    recordFile,
+    `${JSON.stringify({
+      bin: "agy",
+      argv: args,
+      cwd: process.cwd(),
+      claudecode: process.env.CLAUDECODE ?? null,
+      claudeSession: process.env.CLAUDE_CODE_SESSION_ID ?? null,
+      pluginData: process.env.PLUGIN_DATA ?? null,
+      trirelayDepth: process.env.TRIRELAY_DEPTH ?? null
+    })}\n`
+  );
+}
+
+const printArg = args.find((a) => a.startsWith("--print=")) || "";
+const isSchema = args.includes("--json-schema");
+const isReview = printArg.includes("Perform a strict, adversarial code review");
+const isCopy = printArg.includes("Review the draft copy");
+
+let responseText = "FAKE_AGY_OK";
+if (isCopy) {
+  responseText = JSON.stringify({
+    summary: "1 wording suggestion",
+    rows: [{ location: "README:1", current: "Done now", problem: "Wordy", suggestion: "Ready" }]
+  });
+} else if (isReview) {
+  responseText = JSON.stringify({
+    verdict: "approve",
+    summary: "No blocking defects found.",
+    findings: [],
+    next_steps: []
+  });
+} else if (isSchema) {
+  responseText = JSON.stringify({ status: "done", summary: "ok", findings: [], files_touched: [], checks_run: [], next_actions: [] });
+}
+
+console.log(JSON.stringify({ event: "init", conversation_id: "agy-conv-test-1", init: { cwd: process.cwd() } }));
+console.log(
+  JSON.stringify({
+    event: "step_update",
+    step_update: { conversation_id: "agy-conv-test-1", step_index: 1, state: "DONE", step_type: "agent_response", text_delta: responseText }
+  })
+);
+console.log(
+  JSON.stringify({
+    event: "result",
+    result: { conversation_id: "agy-conv-test-1", status: "SUCCESS", response: responseText, num_turns: 1 }
+  })
+);

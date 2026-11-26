@@ -1,0 +1,10 @@
+{
+  "name": "trirelay",
+  "version": "1.0.0",
+  "description": "Host-symmetric multi-agent relay connecting Antigravity (agy), Claude Code, and OpenAI Codex.",
+  "author": {
+    "name": "Jacknegar"
+  },
+  "license": "MIT",
+  "keywords": ["antigravity", "claude-code", "codex", "multi-agent", "mcp"]
+}

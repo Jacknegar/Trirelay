@@ -1,0 +1,56 @@
+{
+  "title": "TrirelayHandoffPacket",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["handoffId", "fromHost", "fromEngine", "toEngine", "role", "goal"],
+  "properties": {
+    "handoffId": { "type": "string", "minLength": 1 },
+    "parentHandoffId": { "type": ["string", "null"] },
+    "workflowId": { "type": ["string", "null"] },
+    "createdAt": { "type": "string" },
+    "fromHost": { "type": "string", "enum": ["agy", "claude", "codex", "cli"] },
+    "fromEngine": { "type": "string", "enum": ["agy", "claude", "codex", "cli"] },
+    "toEngine": { "type": "string", "enum": ["agy", "claude", "codex"] },
+    "role": { "type": "string", "minLength": 1 },
+    "goal": { "type": "string", "minLength": 1 },
+    "scope": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "ownedFiles": { "type": "array", "items": { "type": "string" } },
+        "forbiddenFiles": { "type": "array", "items": { "type": "string" } },
+        "worktreePath": { "type": ["string", "null"] },
+        "branch": { "type": ["string", "null"] },
+        "headSha": { "type": ["string", "null"] }
+      }
+    },
+    "invariants": { "type": "array", "items": { "type": "string" } },
+    "decisionsMade": { "type": "array", "items": { "type": "string" } },
+    "doNotRelitigate": { "type": "array", "items": { "type": "string" } },
+    "openQuestions": { "type": "array", "items": { "type": "string" } },
+    "verification": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "cmd": { "type": "string" },
+          "exit": { "type": ["integer", "null"] },
+          "excerpt": { "type": "string" }
+        }
+      }
+    },
+    "contextDigest": { "type": "string" },
+    "evidence": { "type": "array", "items": { "type": "string" } },
+    "acceptanceCriteria": { "type": "array", "items": { "type": "string" } },
+    "returnContract": { "type": "string" },
+    "sessionLinks": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "agyConversationId": { "type": ["string", "null"] },
+        "claudeSessionId": { "type": ["string", "null"] },
+        "codexThreadId": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

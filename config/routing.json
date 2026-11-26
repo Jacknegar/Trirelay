@@ -1,0 +1,135 @@
+{
+  "version": 2,
+  "defaults": {
+    "maxConcurrency": 4,
+    "maxPerEngine": 2,
+    "defaultTimeoutMs": 600000,
+    "crossVerify": true,
+    "maxReviewGateRounds": 2
+  },
+  "sensitivePathPatterns": [
+    "auth",
+    "login",
+    "permission",
+    "credential",
+    "secret",
+    "token",
+    "billing",
+    "payment",
+    "pricing",
+    "publish",
+    "deploy",
+    "release",
+    "checkpoint",
+    "baseline",
+    "eval",
+    "metric",
+    "persist",
+    "migration",
+    "schema"
+  ],
+  "hostRoleDefaults": {
+    "agy": {
+      "advisor": "claude",
+      "implementer": "codex",
+      "reviewer": "codex",
+      "secondReviewer": "claude"
+    },
+    "claude": {
+      "advisor": "agy",
+      "implementer": "codex",
+      "reviewer": "codex",
+      "secondReviewer": "agy"
+    },
+    "codex": {
+      "advisor": "agy",
+      "implementer": "claude",
+      "reviewer": "claude",
+      "secondReviewer": "agy"
+    },
+    "cli": {
+      "advisor": "agy",
+      "implementer": "codex",
+      "reviewer": "codex",
+      "secondReviewer": "claude"
+    }
+  },
+  "aliases": {
+    "antigravity": "agy",
+    "gemini": "agy",
+    "claude-code": "claude",
+    "openai-codex": "codex",
+    "opus": "claude:opus",
+    "sonnet": "claude:sonnet",
+    "haiku": "claude:haiku",
+    "fable": "claude:fable",
+    "codex-default": "codex",
+    "claude-default": "claude",
+    "agy-default": "agy"
+  },
+  "profiles": {
+    "advisor": {
+      "description": "Read-only architecture advisor, non-anchored second opinion, and UI/README copy reviewer.",
+      "roleKind": "advisor",
+      "candidates": ["agy@high", "claude:opus@high", "codex@high"]
+    },
+    "implementer": {
+      "description": "Isolated module implementer, bug fixer, and test writer (runs in git worktree).",
+      "roleKind": "implementer",
+      "candidates": ["codex@high", "claude:sonnet@high", "agy@high"]
+    },
+    "reviewer": {
+      "description": "Adversarial code reviewer and invariant gatekeeper.",
+      "roleKind": "reviewer",
+      "candidates": ["codex@high", "claude:opus@high", "agy@high"]
+    },
+    "architect": {
+      "description": "System design, decomposition, interface contracts, and trade-off analysis.",
+      "roleKind": "advisor",
+      "candidates": ["claude:opus@high", "agy@high", "codex@high"]
+    },
+    "coder": {
+      "description": "Default implementation, refactoring, and bug fixing.",
+      "roleKind": "implementer",
+      "candidates": ["codex@high", "claude:sonnet@high", "agy@high"]
+    },
+    "coder-max": {
+      "description": "High-complexity algorithms, concurrency, kernels, and deep debugging.",
+      "roleKind": "implementer",
+      "candidates": ["codex@max", "claude:opus@max", "agy@max"]
+    },
+    "ultra": {
+      "description": "Maximum reasoning budget for hardest architectural or root-cause problems.",
+      "roleKind": "implementer",
+      "candidates": ["codex@xhigh", "claude:opus@max", "agy@max"]
+    },
+    "docs": {
+      "description": "Documentation, specs, README clarity, and technical synthesis.",
+      "roleKind": "advisor",
+      "candidates": ["agy@high", "claude:opus@high", "codex@medium"]
+    },
+    "fast": {
+      "description": "Low-latency triage, file discovery, and quick sanity checks.",
+      "roleKind": "advisor",
+      "candidates": ["claude:sonnet@low", "codex@low", "agy@low"]
+    },
+    "explorer": {
+      "description": "Read-only codebase survey and symbol mapping.",
+      "roleKind": "advisor",
+      "candidates": ["claude:sonnet@low", "agy@low", "codex@low"]
+    },
+    "swarm-worker": {
+      "description": "Balanced throughput worker for parallel swarm shards.",
+      "roleKind": "implementer",
+      "candidates": ["codex@medium", "claude:sonnet@medium", "agy@medium"]
+    },
+    "dual-audit": {
+      "description": "Cross-engine parallel adversarial audit using the two non-host engines.",
+      "fanout": ["codex@high", "claude:opus@high", "agy@high"]
+    },
+    "boost-trio": {
+      "description": "Three-engine diverse analysis across Antigravity, Claude Code, and Codex.",
+      "fanout": ["agy@high", "claude:opus@high", "codex@high"]
+    }
+  }
+}

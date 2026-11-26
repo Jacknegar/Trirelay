@@ -1,0 +1,29 @@
+{
+  "title": "TrirelayWorkerResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "findings", "files_touched", "checks_run", "next_actions"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["done", "blocked", "needs-review"]
+    },
+    "summary": { "type": "string" },
+    "findings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "files_touched": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "checks_run": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "next_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}
