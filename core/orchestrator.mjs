@@ -1688,9 +1688,13 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
     let phase1Results = [];
     let critiques = [];
     try {
-      const phase1Promises = modelSpecs.map((spec, idx) => {
-        const route = resolveRoute({ spec, host });
-        return pool.run(route.primary.engine, () =>
+      const resolvedPhase1 = modelSpecs.map((spec, idx) => ({
+        spec,
+        idx,
+        route: resolveRoute({ spec, host })
+      }));
+      const phase1Promises = resolvedPhase1.map(({ spec, idx, route }) =>
+        pool.run(route.primary.engine, () =>
           runSingleTask(
             workspaceRoot,
             {
@@ -1711,8 +1715,8 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
             },
             { signal: boostController.signal }
           )
-        );
-      });
+        )
+      );
       try {
         phase1Results = await Promise.all(phase1Promises);
       } catch (err) {
@@ -1912,84 +1916,111 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
     const completed = new Map();
     const remaining = new Set(byName.keys());
 
-    while (remaining.size > 0) {
-      if (signal?.aborted) break;
-      const readyNames = [...remaining].filter((name) =>
-        byName.get(name).dependsOn.every((dep) => completed.has(dep))
-      );
+    const swarmController = new AbortController();
+    const forwardSwarmAbort = () => swarmController.abort();
+    if (signal) {
+      if (signal.aborted) {
+        swarmController.abort();
+      } else {
+        signal.addEventListener("abort", forwardSwarmAbort, { once: true });
+      }
+    }
 
-      const waveResults = await Promise.all(
-        readyNames.map(async (name) => {
-          if (signal?.aborted) {
-            return { ok: false, cancelled: true, role: name, error: "Cancelled by caller." };
-          }
+    try {
+      while (remaining.size > 0) {
+        if (swarmController.signal.aborted) break;
+        const readyNames = [...remaining].filter((name) =>
+          byName.get(name).dependsOn.every((dep) => completed.has(dep))
+        );
+
+        const preparedWave = readyNames.map((name) => {
           const w = byName.get(name);
           const failedDeps = w.dependsOn.filter((d) => !completed.get(d)?.ok);
           if (failedDeps.length > 0 && w.allowFailedDependency !== true) {
-            const blockedResult = {
-              ok: false,
-              blocked: true,
-              role: name,
-              engine: null,
-              model: null,
-              error: `Blocked because prerequisite worker(s) failed: ${failedDeps.join(", ")}`
-            };
-            postBoardMessage(workspaceRoot, boardId, {
-              author: `swarm:${name}`,
-              tag: "[blocker]",
-              text: blockedResult.error
-            });
-            return blockedResult;
+            return { name, w, failedDeps, blocked: true };
           }
-
           const depEvidence = w.dependsOn.map((d) => {
             const dr = completed.get(d);
             return `Dependency "${d}" (${dr.engine}:${dr.model ?? "default"}, ok=${dr.ok}): ${(dr.output || dr.error || "").slice(0, 500)}${dr.patchPath ? ` [patch: ${dr.patchPath}]` : ""}`;
           });
-
+          const profile = w.profile || (w.mode === "write" ? "swarm-worker" : "explorer");
+          const mode = w.mode ?? "readonly";
           const route = resolveRoute({
-            profile: w.profile || (w.mode === "write" ? "swarm-worker" : "explorer"),
+            profile,
             spec: w.spec,
             engine: w.engine,
             model: w.model,
             effort: w.effort,
             prompt: w.prompt,
-            mode: w.mode ?? "readonly",
+            mode,
             host
           });
+          return { name, w, blocked: false, depEvidence, profile, mode, route };
+        });
 
-          return pool.run(route.primary.engine, () =>
+        const wavePromises = preparedWave.map(async (item) => {
+          if (swarmController.signal.aborted) {
+            return { ok: false, cancelled: true, role: item.name, error: "Cancelled by caller." };
+          }
+          if (item.blocked) {
+            const blockedResult = {
+              ok: false,
+              blocked: true,
+              role: item.name,
+              engine: null,
+              model: null,
+              error: `Blocked because prerequisite worker(s) failed: ${item.failedDeps.join(", ")}`
+            };
+            postBoardMessage(workspaceRoot, boardId, {
+              author: `swarm:${item.name}`,
+              tag: "[blocker]",
+              text: blockedResult.error
+            });
+            return blockedResult;
+          }
+          return pool.run(item.route.primary.engine, () =>
             runSingleTask(
               workspaceRoot,
               {
                 workflowId,
                 boardId,
                 host,
-                role: name,
-                profile: w.profile || (w.mode === "write" ? "swarm-worker" : "explorer"),
-                spec: w.spec,
-                engine: w.engine,
-                model: w.model,
-                effort: w.effort,
-                mode: w.mode ?? "readonly",
-                ownedFiles: w.ownedFiles ?? [],
-                forbiddenFiles: w.forbiddenFiles ?? ["docs/handoff.md"],
-                evidence: depEvidence,
-                invariants: w.invariants ?? [],
-                acceptanceCriteria: w.acceptanceCriteria ?? [],
+                role: item.name,
+                profile: item.profile,
+                spec: item.w.spec,
+                engine: item.w.engine,
+                model: item.w.model,
+                effort: item.w.effort,
+                mode: item.mode,
+                ownedFiles: item.w.ownedFiles ?? [],
+                forbiddenFiles: item.w.forbiddenFiles ?? ["docs/handoff.md"],
+                evidence: item.depEvidence,
+                invariants: item.w.invariants ?? [],
+                acceptanceCriteria: item.w.acceptanceCriteria ?? [],
                 handoff: true,
-                prompt: w.prompt
+                prompt: item.w.prompt
               },
-              { signal }
+              { signal: swarmController.signal }
             )
           );
-        })
-      );
+        });
 
-      for (let i = 0; i < readyNames.length; i += 1) {
-        completed.set(readyNames[i], waveResults[i]);
-        remaining.delete(readyNames[i]);
+        let waveResults;
+        try {
+          waveResults = await Promise.all(wavePromises);
+        } catch (err) {
+          swarmController.abort();
+          await Promise.allSettled(wavePromises);
+          throw err;
+        }
+
+        for (let i = 0; i < readyNames.length; i += 1) {
+          completed.set(readyNames[i], waveResults[i]);
+          remaining.delete(readyNames[i]);
+        }
       }
+    } finally {
+      if (signal) signal.removeEventListener("abort", forwardSwarmAbort);
     }
 
     const ordered = [...completed.values()];
@@ -2086,21 +2117,38 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
     }
   }
 
-  const workerResults = await Promise.all(
-    tasks.map((task, idx) => {
-      const role = task.role || `worker-${idx + 1}`;
-      const mode = task.mode === "write" ? "write" : "readonly";
-      const route = resolveRoute({
-        profile: task.profile || (mode === "write" ? "implementer" : "explorer"),
-        spec: task.spec,
-        engine: task.engine,
-        model: task.model,
-        effort: task.effort,
-        prompt: task.prompt,
-        mode,
-        host
-      });
-      return pool.run(route.primary.engine, () =>
+  const preparedTasks = tasks.map((task, idx) => {
+    const role = task.role || `worker-${idx + 1}`;
+    const mode = task.mode === "write" ? "write" : "readonly";
+    const profile = task.profile || (mode === "write" ? "implementer" : "explorer");
+    const route = resolveRoute({
+      profile,
+      spec: task.spec,
+      engine: task.engine,
+      model: task.model,
+      effort: task.effort,
+      prompt: task.prompt,
+      mode,
+      host
+    });
+    return { task, role, mode, profile, route };
+  });
+
+  const teamController = new AbortController();
+  const forwardTeamAbort = () => teamController.abort();
+  if (signal) {
+    if (signal.aborted) {
+      teamController.abort();
+    } else {
+      signal.addEventListener("abort", forwardTeamAbort, { once: true });
+    }
+  }
+
+  let workerResults = [];
+  let verificationResult = null;
+  try {
+    const workerPromises = preparedTasks.map(({ task, role, mode, profile, route }) =>
+      pool.run(route.primary.engine, () =>
         runSingleTask(
           workspaceRoot,
           {
@@ -2108,7 +2156,7 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
             boardId,
             host,
             role,
-            profile: task.profile || (mode === "write" ? "implementer" : "explorer"),
+            profile,
             spec: task.spec,
             engine: task.engine,
             model: task.model,
@@ -2122,52 +2170,61 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
             outputSchema: task.outputSchema ?? WORKER_SCHEMA,
             prompt: task.prompt
           },
-          { signal }
+          { signal: teamController.signal }
         )
+      )
+    );
+
+    try {
+      workerResults = await Promise.all(workerPromises);
+    } catch (err) {
+      teamController.abort();
+      await Promise.allSettled(workerPromises);
+      throw err;
+    }
+
+    if (!teamController.signal.aborted && params.crossVerify !== false) {
+      const primaryAuthorEngine = workerResults.find((r) => r.mode === "write")?.engine ?? workerResults[0]?.engine ?? "codex";
+      const evidenceLines = workerResults.map(
+        (r) =>
+          `- Worker ${r.role} (${r.engine}:${r.model ?? "default"}, ok=${r.ok}): ${(r.output || r.error || "").slice(0, 500)}${r.patchPath ? ` | patch: ${r.patchPath}` : ""}`
       );
-    })
-  );
+      const patchContents = workerResults
+        .filter((r) => r.patchPath && fs.existsSync(r.patchPath))
+        .map((r) => {
+          const raw = fs.readFileSync(r.patchPath, "utf8");
+          const truncatedNotice = raw.length > 20000 ? "\n[TRUNCATED at 20000 bytes — inspect full patch file]" : "";
+          return `### Patch from ${r.role} (${r.patchPath})\n\`\`\`diff\n${raw.slice(0, 20000)}${truncatedNotice}\n\`\`\``;
+        })
+        .join("\n\n");
 
-  let verificationResult = null;
-  if (!signal?.aborted && params.crossVerify !== false) {
-    const primaryAuthorEngine = workerResults.find((r) => r.mode === "write")?.engine ?? workerResults[0]?.engine ?? "codex";
-    const evidenceLines = workerResults.map(
-      (r) =>
-        `- Worker ${r.role} (${r.engine}:${r.model ?? "default"}, ok=${r.ok}): ${(r.output || r.error || "").slice(0, 500)}${r.patchPath ? ` | patch: ${r.patchPath}` : ""}`
-    );
-    const patchContents = workerResults
-      .filter((r) => r.patchPath && fs.existsSync(r.patchPath))
-      .map((r) => {
-        const raw = fs.readFileSync(r.patchPath, "utf8");
-        const truncatedNotice = raw.length > 20000 ? "\n[TRUNCATED at 20000 bytes — inspect full patch file]" : "";
-        return `### Patch from ${r.role} (${r.patchPath})\n\`\`\`diff\n${raw.slice(0, 20000)}${truncatedNotice}\n\`\`\``;
-      })
-      .join("\n\n");
-
-    verificationResult = await runSingleTask(
-      workspaceRoot,
-      {
-        workflowId,
-        boardId,
-        host,
-        role: "cross-verifier",
-        profile: params.verifierSpec ? null : "opposite-verifier",
-        spec: params.verifierSpec ?? null,
-        authorEngine: primaryAuthorEngine,
-        mode: "readonly",
-        outputSchema: REVIEW_SCHEMA,
-        evidence: evidenceLines,
-        handoff: true,
-        prompt: [
-          "Cross-verify all worker outputs and patches below for correctness, regressions, edge cases, and adherence to acceptance criteria.",
-          patchContents ? `\n${patchContents}` : "",
-          "\nReturn strict JSON matching the review schema."
-        ]
-          .filter(Boolean)
-          .join("\n")
-      },
-      { signal }
-    );
+      verificationResult = await runSingleTask(
+        workspaceRoot,
+        {
+          workflowId,
+          boardId,
+          host,
+          role: "cross-verifier",
+          profile: params.verifierSpec ? null : "opposite-verifier",
+          spec: params.verifierSpec ?? null,
+          authorEngine: primaryAuthorEngine,
+          mode: "readonly",
+          outputSchema: REVIEW_SCHEMA,
+          evidence: evidenceLines,
+          handoff: true,
+          prompt: [
+            "Cross-verify all worker outputs and patches below for correctness, regressions, edge cases, and adherence to acceptance criteria.",
+            patchContents ? `\n${patchContents}` : "",
+            "\nReturn strict JSON matching the review schema."
+          ]
+            .filter(Boolean)
+            .join("\n")
+        },
+        { signal: teamController.signal }
+      );
+    }
+  } finally {
+    if (signal) signal.removeEventListener("abort", forwardTeamAbort);
   }
 
   const workersAccepted = workerResults.every((r) => r.ok && r.structuredOutput?.status !== "blocked");

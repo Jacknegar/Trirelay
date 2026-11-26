@@ -564,12 +564,16 @@ function repairBoardTailLocked(boardFile) {
     closed = true;
 
     if (fragText) {
+      let parsedValid = false;
       try {
         JSON.parse(fragText);
+        parsedValid = true;
+      } catch {
+        // Incomplete JSON line; fall through and truncate back to true boundary.
+      }
+      if (parsedValid) {
         fs.appendFileSync(boardFile, "\n", "utf8");
         return;
-      } catch {
-        // Fall through and truncate incomplete JSON line back to true boundary.
       }
     }
     fs.truncateSync(boardFile, fragOffset);

@@ -1796,7 +1796,128 @@ async function testReleaseGateStateConsistencySuite() {
     try { mcpShut.kill("SIGKILL"); } catch {}
   }
 
-  console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables)");
+  // R8: Clean process exit just before timeoutMs with surviving descendant must NOT flip timedOut=true during sweep
+  {
+    const sweepChildScript = path.join(TMP_BASE, "clean-exit-with-descendant.cjs");
+    const sweepDescPidFile = path.join(TMP_BASE, "clean-exit-desc.pid");
+    fs.writeFileSync(
+      sweepChildScript,
+      [
+        "const fs = require('node:fs');",
+        "const { spawn } = require('node:child_process');",
+        "const desc = spawn(process.execPath, ['-e', \"process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)\"], { stdio: ['ignore', 1, 2] });",
+        `fs.writeFileSync(${JSON.stringify(sweepDescPidFile)}, String(desc.pid));`,
+        "process.exit(0);"
+      ].join("\n"),
+      { mode: 0o644 }
+    );
+    const sweepRes = await spawnJsonlProcess({
+      bin: process.execPath,
+      args: [sweepChildScript],
+      cwd: REPO_DIR,
+      engine: "codex",
+      timeoutMs: 450,
+      killGraceMs: 600
+    });
+    assert.equal(sweepRes.code, 0);
+    assert.equal(sweepRes.timedOut, false, "Clean exit before timeoutMs must stay timedOut=false across descendant group sweep");
+    const descPid = Number(fs.readFileSync(sweepDescPidFile, "utf8").trim());
+    let descAlive = true;
+    try {
+      process.kill(descPid, 0);
+    } catch (e) {
+      if (e.code === "ESRCH") descAlive = false;
+    }
+    assert.equal(descAlive, false, "Surviving descendant must be killed by group sweep");
+  }
+
+  // R9: repairBoardTailLocked via postBoardMessage must NOT truncate a valid final JSONL record missing '\\n' if appendFileSync fails
+  {
+    const r9BoardId = `r9-repair-preserve-${Date.now()}`;
+    postBoardMessage(REPO_DIR, r9BoardId, { author: "a", tag: "[pin]", text: "first valid record" });
+    const r9BoardFile = resolveBoardFile(REPO_DIR, r9BoardId);
+    const secondLine = JSON.stringify({
+      seq: 2,
+      ts: new Date().toISOString(),
+      author: "b",
+      tag: "[note]",
+      text: "second valid record without trailing newline"
+    });
+    fs.appendFileSync(r9BoardFile, secondLine, "utf8");
+    const expectedBeforeAppendFail = fs.readFileSync(r9BoardFile, "utf8");
+    assert.equal(expectedBeforeAppendFail.endsWith("\n"), false);
+
+    const origAppendFileSync = fs.appendFileSync;
+    fs.appendFileSync = (targetPath, ...rest) => {
+      if (path.resolve(String(targetPath)) === path.resolve(r9BoardFile)) {
+        const err = new Error("Simulated ENOSPC while normalizing board newline");
+        err.code = "ENOSPC";
+        throw err;
+      }
+      return origAppendFileSync.call(fs, targetPath, ...rest);
+    };
+    try {
+      assert.throws(
+        () => postBoardMessage(REPO_DIR, r9BoardId, { author: "c", tag: "[note]", text: "third record" }),
+        (err) => err?.code === "ENOSPC"
+      );
+      assert.equal(
+        fs.readFileSync(r9BoardFile, "utf8"),
+        expectedBeforeAppendFail,
+        "appendFileSync failure must NOT fall through to fs.truncateSync and destroy the valid record"
+      );
+    } finally {
+      fs.appendFileSync = origAppendFileSync;
+    }
+    // Recovery succeeds cleanly once disk write works again and both original records remain intact
+    postBoardMessage(REPO_DIR, r9BoardId, { author: "c", tag: "[note]", text: "third record" });
+    const recoveredPosts = readBoardPosts(REPO_DIR, r9BoardId);
+    assert.equal(recoveredPosts.length, 3);
+    assert.equal(recoveredPosts[1].text, "second valid record without trailing newline");
+  }
+
+  // R10: boost, swarm, and teamwork pre-resolve routes before spawning earlier workers when another item fails validation
+  {
+    const beforeBoostLines = fs.existsSync(RECORD_FILE) ? fs.readFileSync(RECORD_FILE, "utf8").split("\n").filter(Boolean).length : 0;
+    await assert.rejects(
+      () =>
+        runOrchestration(REPO_DIR, {
+          pattern: "boost",
+          host: "agy",
+          prompt: "Check rollback on bad spec",
+          models: ["claude:haiku", "bogusengine:model"]
+        }),
+      /Unsupported engine/i
+    );
+    await assert.rejects(
+      () =>
+        runOrchestration(REPO_DIR, {
+          pattern: "swarm",
+          host: "agy",
+          workers: [
+            { name: "ok-worker", engine: "claude", model: "haiku", mode: "readonly", prompt: "say ok" },
+            { name: "bad-worker", spec: "bogusengine:model", mode: "readonly", prompt: "fail route" }
+          ]
+        }),
+      /Unsupported engine/i
+    );
+    await assert.rejects(
+      () =>
+        runOrchestration(REPO_DIR, {
+          pattern: "teamwork",
+          host: "agy",
+          tasks: [
+            { role: "ok-task", engine: "claude", model: "haiku", mode: "readonly", prompt: "say ok" },
+            { role: "bad-task", spec: "bogusengine:model", mode: "readonly", prompt: "fail route" }
+          ]
+        }),
+      /Unsupported engine/i
+    );
+    const afterFanoutLines = fs.existsSync(RECORD_FILE) ? fs.readFileSync(RECORD_FILE, "utf8").split("\n").filter(Boolean).length : 0;
+    assert.equal(afterFanoutLines, beforeBoostLines, "Invalid sibling route must fail before spawning earlier fan-out workers");
+  }
+
+  console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables, R8-R10 sweep/repair/fanout)");
 }
 
 async function main() {

@@ -91,6 +91,14 @@ export function spawnJsonlProcess({
     let exitDrainTimer = null;
     let groupPollTimer = null;
     let finalSettleTimer = null;
+    let timeoutTimer = null;
+
+    function clearTimeoutTimer() {
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
+    }
 
     function isProcessGroupAlive(pid) {
       if (!useProcessGroup || !pid) return false;
@@ -109,10 +117,7 @@ export function spawnJsonlProcess({
     }
 
     function cleanup(preserveForceKill = false) {
-      if (timeoutTimer) {
-        clearTimeout(timeoutTimer);
-        timeoutTimer = null;
-      }
+      clearTimeoutTimer();
       if (exitDrainTimer) {
         clearTimeout(exitDrainTimer);
         exitDrainTimer = null;
@@ -156,6 +161,8 @@ export function spawnJsonlProcess({
       sweepingGroup = true;
       if (markTerminating) {
         terminating = true;
+      } else {
+        clearTimeoutTimer();
       }
       if (exitDrainTimer) {
         clearTimeout(exitDrainTimer);
@@ -202,7 +209,7 @@ export function spawnJsonlProcess({
       }
     }
 
-    let timeoutTimer =
+    timeoutTimer =
       timeoutMs > 0
         ? setTimeout(() => {
             timedOut = true;
@@ -252,7 +259,7 @@ export function spawnJsonlProcess({
 
     function maybeSettleCleanExit(code = exitCode) {
       if (!processExited || !pipesClosed || settled) return;
-      if ((terminating || sweepingGroup) && useProcessGroup && proc.pid && forceKillTimer && isProcessGroupAlive(proc.pid)) {
+      if ((terminating || sweepingGroup) && useProcessGroup && proc.pid && (forceKillTimer || finalSettleTimer) && isProcessGroupAlive(proc.pid)) {
         return;
       }
       if (!terminating && !sweepingGroup && useProcessGroup && proc.pid && isProcessGroupAlive(proc.pid)) {
@@ -265,6 +272,7 @@ export function spawnJsonlProcess({
     proc.on("exit", (code) => {
       processExited = true;
       exitCode = code;
+      clearTimeoutTimer();
       if (pipesClosed) {
         maybeSettleCleanExit(code);
         return;
