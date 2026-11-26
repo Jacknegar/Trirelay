@@ -186,32 +186,38 @@ function matchPathRule(filePath, rule, { isDeny = false } = {}) {
         : normFile === bodyRule || normFile.startsWith(`${bodyRule}/`);
     }
     const ruleSegs = bodyRule.split("/");
-    return trailingSlash
-      ? matchSegments(fileSegs, [...ruleSegs, "*", "**"])
-      : matchSegments(fileSegs, ruleSegs);
+    if (trailingSlash) {
+      if (fileSegs.length < 2) return false;
+      return matchSegments(fileSegs.slice(0, -1), [...ruleSegs, "**"]);
+    }
+    return matchSegments(fileSegs, ruleSegs);
   }
 
-  // Gitignore-style deny rules: leading '/' or './' anchors to root; slash-free unanchored
-  // patterns match at any depth; and any matched ancestor directory covers descendants.
-  const hadLeadingSlash = normRuleRaw.startsWith("/");
-  const hadLeadingDotSlash = normRuleRaw.startsWith("./");
+  // Gitignore-style deny rules: normalize repeated separators; leading '/' or './' anchors to root;
+  // unanchored slash-free patterns match at any depth; and matched ancestors cover descendants.
+  const collapsedDeny = normRuleRaw.replace(/\/+/g, "/");
+  const hadLeadingSlash = collapsedDeny.startsWith("/");
+  const hadLeadingDotSlash = collapsedDeny.startsWith("./");
   const anchoredToRoot = hadLeadingSlash || hadLeadingDotSlash;
-  const cleanRule = hadLeadingSlash ? normRuleRaw.slice(1) : hadLeadingDotSlash ? normRuleRaw.slice(2) : normRuleRaw;
+  const cleanRule = (hadLeadingSlash ? collapsedDeny.slice(1) : collapsedDeny).replace(/^\.\//, "");
   if (!cleanRule) return false;
 
   const trailingSlash = cleanRule.endsWith("/");
   const bodyRule = trailingSlash ? cleanRule.slice(0, -1) : cleanRule;
   if (!bodyRule) return false;
 
-  const ruleSegs = bodyRule.split("/");
+  const ruleSegs = bodyRule.split("/").filter(Boolean);
+  if (ruleSegs.length === 0) return false;
   const effectiveSegs =
     !anchoredToRoot && ruleSegs.length === 1 && ruleSegs[0] !== "**"
       ? ["**", ...ruleSegs]
       : ruleSegs;
 
-  return trailingSlash
-    ? matchSegments(fileSegs, [...effectiveSegs, "*", "**"])
-    : matchSegments(fileSegs, [...effectiveSegs, "**"]);
+  if (trailingSlash) {
+    if (fileSegs.length < 2) return false;
+    return matchSegments(fileSegs.slice(0, -1), [...effectiveSegs, "**"]);
+  }
+  return matchSegments(fileSegs, [...effectiveSegs, "**"]);
 }
 
 export function auditFileScope(changedFiles = [], { ownedFiles = [], forbiddenFiles = [] } = {}) {

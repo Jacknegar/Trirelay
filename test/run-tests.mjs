@@ -2575,6 +2575,12 @@ async function testReleaseGateStateConsistencySuite() {
     assert.equal(auditFileScope(["src/app.js"], { ownedFiles: ["/src/**"] }).length, 1, "Leading '/' in ownedFiles stays unstripped");
     assert.equal(auditFileScope(["src/app.js"], { ownedFiles: ["src//*.js"] }).length, 1, "Empty segment in '//' must not collapse");
     assert.equal(auditFileScope(["src/app.js"], { ownedFiles: ["./src/**"] }).length, 0);
+    assert.equal(auditFileScope(["README.md", "core/worktree.mjs"], { ownedFiles: ["**/"] }).length, 1, "Directory-only '**/' requires a parent directory");
+    assert.equal(auditFileScope(["README.md", "core/worktree.mjs"], { forbiddenFiles: ["**/"] }).length, 1);
+    assert.equal(auditFileScope(["README.md", "core/worktree.mjs"], { forbiddenFiles: ["/**/"] }).length, 1);
+    assert.equal(auditFileScope(["core/worktree.mjs"], { forbiddenFiles: ["core//*.mjs"] }).length, 1);
+    assert.equal(auditFileScope(["core/worktree.mjs"], { forbiddenFiles: ["//core/*.mjs"] }).length, 1);
+    assert.equal(auditFileScope(["core", "core/worktree.mjs"], { forbiddenFiles: ["core//"] }).length, 1);
     assert.equal(auditFileScope(["src/app.js", "src/a/b/app.js"], { ownedFiles: ["src/**/app.js"] }).length, 0);
 
     // Separated globstars & deep-path single-pass scaling stay fast (linear O(D*R), no O(D^2) prefix rescan)
