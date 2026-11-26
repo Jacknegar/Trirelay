@@ -61,6 +61,18 @@ export function spawnJsonlProcess({
   onStderr = null
 }) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      resolve({
+        code: null,
+        spawnError: null,
+        timedOut: false,
+        aborted: true,
+        stdinError: null,
+        stderr: "",
+        trailingStdout: ""
+      });
+      return;
+    }
     const useProcessGroup = process.platform !== "win32";
     const graceMs = Math.max(100, Math.min(3000, Number.isFinite(Number(killGraceMs)) ? Number(killGraceMs) : 1500));
     const env = buildWorkerEnv(process.env, {

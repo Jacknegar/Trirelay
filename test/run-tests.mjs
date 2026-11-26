@@ -91,6 +91,7 @@ const {
   spawnJsonlProcess
 } = await import("../core/drivers/common.mjs");
 const {
+  ConcurrencyPool,
   assertRecursionSafe,
   inspectReviewArtifact,
   runCopyReview,
@@ -2470,7 +2471,62 @@ async function testReleaseGateStateConsistencySuite() {
     }
   }
 
-  console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables, R8-R24 audit hardening)");
+  // R25: Post-grant microtask abort skips fn() & releases slot; pre-aborted spawnJsonlProcess never spawns child
+  {
+    const poolR25 = new ConcurrencyPool(2, 1);
+    let releaseFirst;
+    let markStarted1;
+    const firstStarted = new Promise((r) => {
+      markStarted1 = r;
+    });
+    const firstDone = new Promise((r) => {
+      releaseFirst = r;
+    });
+    const p1 = poolR25.run("claude", () => {
+      markStarted1();
+      return firstDone;
+    });
+    const acR25 = new AbortController();
+    let fnCalled = 0;
+    const p2 = poolR25.run(
+      "claude",
+      async () => {
+        fnCalled += 1;
+        return "SHOULD_NOT_RUN";
+      },
+      { signal: acR25.signal }
+    );
+    await firstStarted;
+    assert.equal(poolR25.waiters.length, 1);
+    releaseFirst("first-done");
+    await Promise.resolve();
+    // release() just granted the slot (waiters=0, active=1) and removed the abort listener; abort before p2's acquire continuation runs
+    assert.equal(poolR25.waiters.length, 0);
+    acR25.abort();
+    await p1;
+    const resP2 = await p2;
+    assert.equal(resP2, null, "Post-grant microtask abort must skip fn() and return null");
+    assert.equal(fnCalled, 0, "Driver callback must NOT run after post-grant abort");
+    assert.equal(poolR25.activeGlobal, 0);
+    assert.equal(poolR25.activeByEngine.claude, 0);
+    assert.equal(poolR25.waiters.length, 0);
+
+    const preAbortMarker = path.join(TMP_BASE, "pre-abort-should-not-exist.txt");
+    const preAbortAc = new AbortController();
+    preAbortAc.abort();
+    const preAbortRes = await spawnJsonlProcess({
+      bin: process.execPath,
+      args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(preAbortMarker)}, 'ran')`],
+      cwd: REPO_DIR,
+      engine: "claude",
+      signal: preAbortAc.signal
+    });
+    assert.equal(preAbortRes.aborted, true);
+    assert.equal(preAbortRes.code, null);
+    assert.equal(fs.existsSync(preAbortMarker), false, "Pre-aborted spawnJsonlProcess must not spawn subprocess");
+  }
+
+  console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables, R8-R25 audit hardening)");
 }
 
 async function main() {

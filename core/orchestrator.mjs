@@ -144,7 +144,7 @@ export function validateCallerArgs(params = {}) {
   }
 }
 
-class ConcurrencyPool {
+export class ConcurrencyPool {
   constructor(maxGlobal = 4, maxPerEngine = 2) {
     this.maxGlobal = Math.max(1, maxGlobal);
     this.maxPerEngine = Math.max(1, maxPerEngine);
@@ -159,6 +159,9 @@ class ConcurrencyPool {
       return null;
     }
     try {
+      if (signal?.aborted) {
+        return null;
+      }
       return await fn();
     } finally {
       this.release(engine);
