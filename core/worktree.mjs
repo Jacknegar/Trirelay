@@ -170,58 +170,48 @@ function matchPathRule(filePath, rule, { isDeny = false } = {}) {
   const normFile = (isWin ? rawFile.replace(/\\/g, "/") : rawFile).replace(/^\.\//, "");
   const rawRule = String(rule || "").trim();
   const normRuleRaw = isWin ? rawRule.replace(/\\/g, "/") : rawRule;
-  const anchoredToRoot = normRuleRaw.startsWith("/");
-  const cleanRule = normRuleRaw.replace(/^\/+/, "").replace(/^\.\//, "");
-  if (!cleanRule || !normFile) return false;
-
-  const trailingSlash = cleanRule.endsWith("/");
-  const bodyRule = trailingSlash ? cleanRule.replace(/\/+$/, "") : cleanRule;
-  if (!bodyRule) return false;
+  if (!normRuleRaw || !normFile) return false;
 
   const fileSegs = normFile.split("/");
-  const ruleSegs = bodyRule.split("/").filter(Boolean);
-  if (ruleSegs.length === 0) return false;
 
   if (!isDeny) {
-    if (trailingSlash) {
-      for (let end = 1; end < fileSegs.length; end += 1) {
-        if (matchSegments(fileSegs.slice(0, end), ruleSegs)) {
-          return true;
-        }
-      }
-      return false;
-    }
+    const cleanRule = normRuleRaw.replace(/^\.\//, "");
+    if (!cleanRule) return false;
+    const trailingSlash = cleanRule.endsWith("/");
+    const bodyRule = trailingSlash ? cleanRule.slice(0, -1) : cleanRule;
+    if (!bodyRule) return false;
     if (!bodyRule.includes("*") && !bodyRule.includes("?")) {
-      return normFile === bodyRule || normFile.startsWith(`${bodyRule}/`);
+      return trailingSlash
+        ? normFile.startsWith(cleanRule)
+        : normFile === bodyRule || normFile.startsWith(`${bodyRule}/`);
     }
-    return matchSegments(fileSegs, ruleSegs);
+    const ruleSegs = bodyRule.split("/");
+    return trailingSlash
+      ? matchSegments(fileSegs, [...ruleSegs, "*", "**"])
+      : matchSegments(fileSegs, ruleSegs);
   }
 
-  // Gitignore-style deny rules: slash-free patterns without leading '/' match at any depth,
-  // and any matched ancestor directory covers all nested descendants.
+  // Gitignore-style deny rules: leading '/' or './' anchors to root; slash-free unanchored
+  // patterns match at any depth; and any matched ancestor directory covers descendants.
+  const hadLeadingSlash = normRuleRaw.startsWith("/");
+  const hadLeadingDotSlash = normRuleRaw.startsWith("./");
+  const anchoredToRoot = hadLeadingSlash || hadLeadingDotSlash;
+  const cleanRule = hadLeadingSlash ? normRuleRaw.slice(1) : hadLeadingDotSlash ? normRuleRaw.slice(2) : normRuleRaw;
+  if (!cleanRule) return false;
+
+  const trailingSlash = cleanRule.endsWith("/");
+  const bodyRule = trailingSlash ? cleanRule.slice(0, -1) : cleanRule;
+  if (!bodyRule) return false;
+
+  const ruleSegs = bodyRule.split("/");
   const effectiveSegs =
     !anchoredToRoot && ruleSegs.length === 1 && ruleSegs[0] !== "**"
       ? ["**", ...ruleSegs]
       : ruleSegs;
 
-  if (trailingSlash) {
-    for (let end = 1; end < fileSegs.length; end += 1) {
-      if (matchSegments(fileSegs.slice(0, end), effectiveSegs)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  if (matchSegments(fileSegs, effectiveSegs)) {
-    return true;
-  }
-  for (let end = 1; end < fileSegs.length; end += 1) {
-    if (matchSegments(fileSegs.slice(0, end), effectiveSegs)) {
-      return true;
-    }
-  }
-  return false;
+  return trailingSlash
+    ? matchSegments(fileSegs, [...effectiveSegs, "*", "**"])
+    : matchSegments(fileSegs, [...effectiveSegs, "**"]);
 }
 
 export function auditFileScope(changedFiles = [], { ownedFiles = [], forbiddenFiles = [] } = {}) {

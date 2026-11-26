@@ -2565,19 +2565,24 @@ async function testReleaseGateStateConsistencySuite() {
     // Gitignore-style deny idioms in forbiddenFiles vs strict segment globs in ownedFiles
     assert.equal(auditFileScope(["prod.pem", "deploy/prod.pem"], { forbiddenFiles: ["*.pem"] }).length, 2);
     assert.equal(auditFileScope(["prod.pem", "deploy/prod.pem"], { forbiddenFiles: ["/*.pem"] }).length, 1);
+    assert.equal(auditFileScope(["prod.pem", "deploy/prod.pem"], { forbiddenFiles: ["./*.pem"] }).length, 1);
     assert.equal(auditFileScope(["secrets/k", "secrets/prod/key"], { forbiddenFiles: ["secrets/*"] }).length, 2);
     assert.equal(auditFileScope(["secrets", "app/secrets", "app/secrets/k.json"], { forbiddenFiles: ["**/secrets"] }).length, 3);
     assert.equal(auditFileScope(["packages/api/dist/out.js", "packages/api/dist"], { forbiddenFiles: ["packages/*/dist/"] }).length, 1);
     assert.equal(auditFileScope(["a", "a/b"], { forbiddenFiles: ["*"] }).length, 2);
     assert.equal(auditFileScope(["a", "a/b"], { ownedFiles: ["*"] }).length, 1);
 
+    assert.equal(auditFileScope(["src/app.js"], { ownedFiles: ["/src/**"] }).length, 1, "Leading '/' in ownedFiles stays unstripped");
+    assert.equal(auditFileScope(["src/app.js"], { ownedFiles: ["src//*.js"] }).length, 1, "Empty segment in '//' must not collapse");
+    assert.equal(auditFileScope(["src/app.js"], { ownedFiles: ["./src/**"] }).length, 0);
     assert.equal(auditFileScope(["src/app.js", "src/a/b/app.js"], { ownedFiles: ["src/**/app.js"] }).length, 0);
 
-    // Separated globstars do not backtrack exponentially
+    // Separated globstars & deep-path single-pass scaling stay fast (linear O(D*R), no O(D^2) prefix rescan)
+    const deepPaths = Array.from({ length: 12 }, (_, idx) => `${"a/".repeat(1600)}z-${idx}`);
     const redosStart = Date.now();
-    const redosOut = auditFileScope([`${"a/".repeat(50)}z`], { forbiddenFiles: ["**/a/**/a/**/a/**/a/**/a/**/a/**/a/**/b"] });
-    assert.equal(redosOut.length, 0);
-    assert.ok(Date.now() - redosStart < 100, "Separated globstars must evaluate linearly without ReDoS");
+    assert.equal(auditFileScope(deepPaths, { forbiddenFiles: ["*.pem"] }).length, 0);
+    assert.equal(auditFileScope(deepPaths.slice(0, 1), { forbiddenFiles: ["**/a/**/a/**/a/**/a/**/a/**/a/**/a/**/b"] }).length, 0);
+    assert.ok(Date.now() - redosStart < 200, "Deep single-pass glob evaluation must avoid quadratic/exponential blowup");
   }
 
   console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables, R8-R26 audit hardening)");
