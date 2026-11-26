@@ -16,6 +16,7 @@ import { createHandoffPacket, listWorkspaceClaudeSessions, loadHandoffPacket } f
 import { handleJobControl, launchBackgroundJob } from "../core/jobs.mjs";
 import {
   assertRecursionSafe,
+  inspectReviewArtifact,
   runCopyReview,
   runDualDesign,
   runDualReview,
@@ -28,7 +29,9 @@ import { getFullModelCatalog, resolveRoute } from "../core/router.mjs";
 import {
   loadHostSession,
   postBoardMessage,
+  readActiveBoardPins,
   readBoardPosts,
+  readBoardPostsBySeqs,
   readJsonSafe
 } from "../core/state.mjs";
 import { applyWorktreePatch } from "../core/worktree.mjs";
@@ -112,7 +115,12 @@ const TOOLS = [
         ownedFiles: { type: "array", items: { type: "string" } },
         forbiddenFiles: { type: "array", items: { type: "string" } },
         invariants: { type: "array", items: { type: "string" } },
+        decisionsMade: { type: "array", items: { type: "string" } },
+        doNotRelitigate: { type: "array", items: { type: "string" } },
+        supersededDecisions: { type: "array", items: { type: "string" } },
+        deprecatedInvariants: { type: "array", items: { type: "string" } },
         acceptanceCriteria: { type: "array", items: { type: "string" } },
+        parentHandoffId: { type: "string" },
         handoffId: { type: "string" },
         handoff: { type: "boolean" },
         includeHostDigest: { type: "boolean" },
@@ -129,11 +137,16 @@ const TOOLS = [
   {
     name: "relay_review",
     description:
-      "Run Goldfish (zero-history) adversarial code review using agy, claude, codex, or both non-host engines in parallel. Auto-upgrades to xhigh on sensitive paths.",
+      "Run Goldfish (zero-history) adversarial code review (`action='run'`) or paginate stored findings without side effects (`action='inspect'`, `reviewId`).",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
+        action: { type: "string", enum: ["run", "inspect"], default: "run" },
+        reviewId: { type: "string" },
+        offset: { type: "number", default: 0 },
+        limit: { type: "number", default: 10 },
+        severity: { type: "string" },
         cwd: { type: "string" },
         host: { type: "string", enum: ["agy", "claude", "codex", "cli"] },
         background: { type: "boolean", default: false },
@@ -153,11 +166,16 @@ const TOOLS = [
   {
     name: "relay_review_gate",
     description:
-      "Bounded 2-round blocking vs advisory review gate. Escalates remaining blocking findings to user after maxRounds (default 2).",
+      "Bounded 2-round cycle-scoped blocking vs advisory review gate (`action='run'` or `action='inspect'` with `reviewId`). Escalates after maxRounds within an unpassed cycle.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
+        action: { type: "string", enum: ["run", "inspect"], default: "run" },
+        reviewId: { type: "string" },
+        offset: { type: "number", default: 0 },
+        limit: { type: "number", default: 10 },
+        severity: { type: "string" },
         cwd: { type: "string" },
         host: { type: "string", enum: ["agy", "claude", "codex", "cli"] },
         gateKey: { type: "string" },
@@ -272,6 +290,7 @@ const TOOLS = [
       properties: {
         action: { type: "string", enum: ["create", "inspect", "list_claude_sessions"] },
         cwd: { type: "string" },
+        parentHandoffId: { type: "string" },
         handoffId: { type: "string" },
         workflowId: { type: "string" },
         boardId: { type: "string" },
@@ -284,6 +303,8 @@ const TOOLS = [
         invariants: { type: "array", items: { type: "string" } },
         decisionsMade: { type: "array", items: { type: "string" } },
         doNotRelitigate: { type: "array", items: { type: "string" } },
+        supersededDecisions: { type: "array", items: { type: "string" } },
+        deprecatedInvariants: { type: "array", items: { type: "string" } },
         openQuestions: { type: "array", items: { type: "string" } },
         evidence: { type: "array", items: { type: "string" } },
         acceptanceCriteria: { type: "array", items: { type: "string" } },
@@ -296,7 +317,7 @@ const TOOLS = [
   {
     name: "relay_board",
     description:
-      "Read (3-tier Pin/Stub/Recall by default, or view='full') or post messages on the shared multi-engine coordination board.",
+      "Read (3-tier Pin/Stub/Recall by default, or view='full' / pinsOnly / seqs) or post messages (supporting pinId / supersedes) on the shared board.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -306,11 +327,15 @@ const TOOLS = [
         cwd: { type: "string" },
         boardId: { type: "string", default: "default" },
         view: { type: "string", enum: ["tiered", "full"], default: "tiered" },
+        pinsOnly: { type: "boolean", default: false },
+        seqs: { type: "array", items: { type: "number" } },
         since: { type: "number", default: 0 },
         limit: { type: "number", default: 100 },
         author: { type: "string" },
         tag: { type: "string" },
-        text: { type: "string" }
+        text: { type: "string" },
+        pinId: { type: "string" },
+        supersedes: { type: "string" }
       }
     }
   },
@@ -449,6 +474,9 @@ async function handleToolCall(name, args = {}) {
     case "relay_review": {
       assertRecursionSafe(cwd);
       validateCallerArgs(args);
+      if (args.action === "inspect" || args.reviewId) {
+        return inspectReviewArtifact(cwd, args);
+      }
       if (args.background) {
         return launchBackgroundJob(
           cwd,
@@ -460,8 +488,12 @@ async function handleToolCall(name, args = {}) {
       return { isToolError: !res.ok, data: res };
     }
 
-    case "relay_review_gate":
+    case "relay_review_gate": {
+      if (args.action === "inspect" || args.reviewId) {
+        return inspectReviewArtifact(cwd, args);
+      }
       return await runReviewGate(cwd, args);
+    }
 
     case "relay_design": {
       if (args.action === "start" && args.background) {
@@ -532,17 +564,28 @@ async function handleToolCall(name, args = {}) {
     case "relay_board": {
       const boardId = args.boardId || "default";
       if (args.action === "read") {
-        const posts = readBoardPosts(cwd, boardId, { since: args.since ?? 0, limit: args.limit ?? 100 });
+        if (args.pinsOnly) {
+          return { boardId, view: "pinsOnly", pins: readActiveBoardPins(cwd, boardId) };
+        }
+        if (Array.isArray(args.seqs) && args.seqs.length > 0) {
+          return { boardId, view: "seqs", posts: readBoardPostsBySeqs(cwd, boardId, args.seqs) };
+        }
         if (args.view === "full") {
+          const fullLimit = args.limit !== undefined ? args.limit : 0;
+          const posts = readBoardPosts(cwd, boardId, { since: args.since ?? 0, limit: fullLimit });
           return { boardId, view: "full", posts };
         }
-        return buildTieredBoardView(posts, { boardId });
+        const posts = readBoardPosts(cwd, boardId, { since: args.since ?? 0, limit: args.limit ?? 100 });
+        const activePins = readActiveBoardPins(cwd, boardId);
+        return buildTieredBoardView(posts, { pinnedPosts: activePins, boardId });
       }
       if (args.action === "post") {
         return postBoardMessage(cwd, boardId, {
           author: args.author || "coordinator",
           tag: args.tag || "[update]",
-          text: args.text || ""
+          text: args.text || "",
+          pinId: args.pinId,
+          supersedes: args.supersedes
         });
       }
       throw new Error(`Unknown relay_board action: ${args.action}`);
@@ -615,7 +658,8 @@ async function handleRequest(msg) {
 
         const allowUnboundedRecall =
           (toolName === "relay_jobs" && toolArgs.compact === false) ||
-          (toolName === "relay_board" && toolArgs.view === "full") ||
+          (toolName === "relay_board" && (toolArgs.view === "full" || toolArgs.pinsOnly === true || Array.isArray(toolArgs.seqs))) ||
+          ((toolName === "relay_review" || toolName === "relay_review_gate") && (toolArgs.action === "inspect" || Boolean(toolArgs.reviewId))) ||
           toolName === "relay_handoff";
 
         const serialized = serializeMcpPayload(toolName, payload, {

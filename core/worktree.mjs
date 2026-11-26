@@ -46,11 +46,25 @@ export function parsePorcelainZ(bufStr) {
   return [...new Set(files)];
 }
 
-export function createIsolatedWorktree(repoRoot, { id = null, branch = null } = {}) {
+export function createIsolatedWorktree(repoRoot, { id = null, branch = null, baseSha: explicitBaseSha = null } = {}) {
   if (!isGitRepo(repoRoot)) {
     throw new Error(`Cannot create isolated git worktree: ${repoRoot} is not inside a git repository.`);
   }
-  const baseSha = getGitHeadSha(repoRoot);
+  let baseSha = getGitHeadSha(repoRoot);
+  if (explicitBaseSha) {
+    const cleanBase = String(explicitBaseSha).trim();
+    if (!cleanBase || cleanBase.startsWith("-")) {
+      throw new Error(`Invalid worktree baseSha "${cleanBase}".`);
+    }
+    const check = runSync("git", ["rev-parse", "--verify", "--end-of-options", `${cleanBase}^{commit}`], {
+      cwd: repoRoot,
+      timeoutMs: 3000
+    });
+    if (check.status !== 0 || !String(check.stdout).trim()) {
+      throw new Error(`Worktree baseSha "${cleanBase}" does not resolve to a valid commit.`);
+    }
+    baseSha = String(check.stdout).trim();
+  }
   if (!baseSha) {
     throw new Error(
       `Cannot create isolated git worktree in ${repoRoot}: repository has no commits (HEAD is unborn). Create an initial commit first.`
@@ -184,6 +198,8 @@ export function captureWorktreeChanges(repoRoot, worktreePath, worktreeId, baseS
   if (changedFiles.length === 0) {
     return {
       hasChanges: ignoredFiles.length > 0,
+      deliverableMode: ignoredFiles.length > 0 ? "ignored-only" : "none",
+      ignoredOnlyDeliverables: ignoredFiles.length > 0,
       captureComplete: true,
       error: null,
       changedFiles: [],
@@ -253,6 +269,8 @@ export function captureWorktreeChanges(repoRoot, worktreePath, worktreeId, baseS
 
   return {
     hasChanges: true,
+    deliverableMode: "patch",
+    ignoredOnlyDeliverables: false,
     captureComplete: true,
     error: null,
     changedFiles,
@@ -261,6 +279,20 @@ export function captureWorktreeChanges(repoRoot, worktreePath, worktreeId, baseS
     diffStat: String(statRes.stdout || "").trim(),
     finalHeadSha
   };
+}
+
+export function applyPatchToWorktree(worktreePath, patchPath) {
+  if (!worktreePath || !fs.existsSync(worktreePath)) {
+    throw new Error(`Target worktree does not exist: ${worktreePath}`);
+  }
+  if (!patchPath || !fs.existsSync(patchPath)) {
+    throw new Error(`Replay patch file not found: ${patchPath}`);
+  }
+  const res = runSync("git", ["apply", "--binary", patchPath], { cwd: worktreePath, timeoutMs: 15000 });
+  if (res.status !== 0) {
+    throw new Error(`Failed to replay prior patch into worktree: ${String(res.stderr).trim() || String(res.stdout).trim()}`);
+  }
+  return { ok: true, worktreePath, patchPath };
 }
 
 export function removeIsolatedWorktree(repoRoot, worktreePath) {

@@ -12,6 +12,8 @@ import { createHandoffPacket, listWorkspaceClaudeSessions, loadHandoffPacket } f
 import { executeInstall } from "../core/installer.mjs";
 import { handleJobControl } from "../core/jobs.mjs";
 import {
+  assertRecursionSafe,
+  inspectReviewArtifact,
   runCopyReview,
   runDualDesign,
   runDualReview,
@@ -20,7 +22,7 @@ import {
   runSingleTask
 } from "../core/orchestrator.mjs";
 import { getFullModelCatalog, resolveRoute } from "../core/router.mjs";
-import { postBoardMessage, readBoardPosts } from "../core/state.mjs";
+import { postBoardMessage, readActiveBoardPins, readBoardPosts, readBoardPostsBySeqs } from "../core/state.mjs";
 import { applyWorktreePatch } from "../core/worktree.mjs";
 
 const BOOLEAN_FLAGS = new Set([
@@ -45,7 +47,8 @@ const BOOLEAN_FLAGS = new Set([
   "apply",
   "dry-run",
   "no-exclude-host",
-  "no-compact"
+  "no-compact",
+  "pins-only"
 ]);
 
 function parseArgs(argv) {
@@ -243,6 +246,16 @@ async function main() {
     }
 
     case "review": {
+      if (positionals[0] === "inspect" || options["review-id"]) {
+        const res = inspectReviewArtifact(cwd, {
+          reviewId: options["review-id"] || positionals[1],
+          offset: options.offset ? Number(options.offset) : 0,
+          limit: options.limit ? Number(options.limit) : 10,
+          severity: options.severity || null
+        });
+        printOutput(res, true);
+        break;
+      }
       const res = await runDualReview(cwd, {
         host,
         engine: options.engine || "both",
@@ -424,23 +437,40 @@ async function main() {
       const action = positionals[0] || "read";
       const boardId = options.board || "default";
       if (action === "read") {
-        const posts = readBoardPosts(cwd, boardId, {
-          since: Number(options.since || 0),
-          limit: Number(options.limit || 100)
-        });
+        if (options["pins-only"]) {
+          printOutput({ boardId, view: "pinsOnly", pins: readActiveBoardPins(cwd, boardId) }, true);
+          break;
+        }
+        if (options.seqs) {
+          const seqs = String(options.seqs).split(",").map((s) => Number(s.trim())).filter(Number.isFinite);
+          printOutput({ boardId, view: "seqs", posts: readBoardPostsBySeqs(cwd, boardId, seqs) }, true);
+          break;
+        }
         const view = options.view || "tiered";
         if (view === "full") {
+          const fullLimit = options.limit !== undefined ? Number(options.limit) : 0;
+          const posts = readBoardPosts(cwd, boardId, {
+            since: Number(options.since || 0),
+            limit: fullLimit
+          });
           printOutput({ boardId, view: "full", posts }, true);
         } else {
+          const posts = readBoardPosts(cwd, boardId, {
+            since: Number(options.since || 0),
+            limit: Number(options.limit || 100)
+          });
+          const activePins = readActiveBoardPins(cwd, boardId);
           const { buildTieredBoardView } = await import("../core/compact.mjs");
-          printOutput(buildTieredBoardView(posts, { boardId }), true);
+          printOutput(buildTieredBoardView(posts, { pinnedPosts: activePins, boardId }), true);
         }
       } else if (action === "post") {
         printOutput(
           postBoardMessage(cwd, boardId, {
             author: options.author || "coordinator",
             tag: options.tag || "[update]",
-            text: options.text || positionals.slice(1).join(" ")
+            text: options.text || positionals.slice(1).join(" "),
+            pinId: options["pin-id"],
+            supersedes: options.supersedes
           }),
           true
         );

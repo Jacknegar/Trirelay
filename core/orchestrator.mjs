@@ -30,7 +30,9 @@ import {
   generateId,
   isInsideManagedWorktree,
   loadDesignVault,
+  loadReviewArtifact,
   lookupRoleSession,
+  lookupSessionById,
   nowIso,
   postBoardMessage,
   readJsonSafe,
@@ -38,6 +40,7 @@ import {
   releaseSessionLease,
   resolveJobLogFile,
   saveDesignVault,
+  saveReviewArtifact,
   saveReviewGateState,
   updateDesignVault,
   upsertJob,
@@ -45,9 +48,11 @@ import {
   withReviewGateLock
 } from "./state.mjs";
 import {
+  applyPatchToWorktree,
   auditFileScope,
   captureWorktreeChanges,
   createIsolatedWorktree,
+  getGitHeadSha,
   isGitRepo,
   removeIsolatedWorktree
 } from "./worktree.mjs";
@@ -113,12 +118,29 @@ export function validateCallerArgs(params = {}) {
   if (params.resumeSessionId) {
     validateOpaqueId(params.resumeSessionId, "resumeSessionId");
   }
-  for (const arrKey of ["ownedFiles", "forbiddenFiles", "invariants", "acceptanceCriteria", "contextPaths", "models"]) {
+  for (const arrKey of [
+    "ownedFiles",
+    "forbiddenFiles",
+    "invariants",
+    "decisionsMade",
+    "doNotRelitigate",
+    "supersededDecisions",
+    "deprecatedInvariants",
+    "acceptanceCriteria",
+    "contextPaths",
+    "models"
+  ]) {
     if (params[arrKey] !== undefined && params[arrKey] !== null) {
       if (!Array.isArray(params[arrKey]) || !params[arrKey].every((item) => typeof item === "string")) {
         throw new Error(`Invalid "${arrKey}": must be an array of strings.`);
       }
     }
+  }
+  if (params.parentHandoffId) {
+    validateOpaqueId(params.parentHandoffId, "parentHandoffId");
+  }
+  if (params.reviewId) {
+    validateOpaqueId(params.reviewId, "reviewId");
   }
 }
 
@@ -275,43 +297,115 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
     throw new Error('Security error: mode="write" always requires isolated git worktree (`worktree` cannot be false).');
   }
   const useWorktree = mode === "write" ? true : Boolean(params.worktree);
-  let worktree = null;
-  let effectiveCwd = workspaceRoot;
-
-  if (useWorktree) {
-    if (!isGitRepo(workspaceRoot)) {
-      throw new Error(
-        `Isolated git worktree required for mode="${mode}" (or worktree=true), but "${workspaceRoot}" is not a git repository.`
-      );
-    }
-    worktree = createIsolatedWorktree(workspaceRoot, {
-      id: `${role}-${jobId}`.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 72),
-      branch: params.worktreeBranch || null
-    });
-    effectiveCwd = worktree.worktreePath;
-    appendJobLog(logFile, `Created isolated worktree at ${worktree.worktreePath} (base=${worktree.baseSha})`);
+  if (useWorktree && !isGitRepo(workspaceRoot)) {
+    throw new Error(
+      `Isolated git worktree required for mode="${mode}" (or worktree=true), but "${workspaceRoot}" is not a git repository.`
+    );
   }
 
+  // Resolve prior session & bound code state BEFORE creating a new worktree so
+  // `resumeRole` / `resumeSessionId` stays bound to its unmerged edits.
+  let resumeSessionId = params.resumeSessionId || null;
+  let sessionEntry = null;
+  if (resumeSessionId) {
+    sessionEntry = lookupSessionById(workspaceRoot, { engine: route.primary.engine, sessionId: resumeSessionId });
+  } else if (params.resumeRole) {
+    sessionEntry = lookupRoleSession(workspaceRoot, {
+      workflowId,
+      role,
+      engine: route.primary.engine
+    });
+    if (sessionEntry?.sessionId) {
+      resumeSessionId = sessionEntry.sessionId;
+    }
+  }
+  const sessionCwd = sessionEntry?.sessionCwd ?? null;
+
+  // Only Claude and Codex actually fork sessions; agy always requires single-writer lease.
+  const willFork = Boolean(params.forkSession) && (route.primary.engine === "claude" || route.primary.engine === "codex");
   let leaseAcquired = false;
   let leasedEngine = null;
   let leasedSessionId = null;
 
-  upsertJob(workspaceRoot, {
-    id: jobId,
-    kind: "run",
-    workflowId,
-    role,
-    mode,
-    status: "running",
-    engine: route.primary.engine,
-    model: route.primary.model,
-    effort: route.primary.effort,
-    worktreePath: worktree?.worktreePath ?? null,
-    logFile,
-    startedAt: nowIso()
-  });
+  if (resumeSessionId && !willFork) {
+    leaseAcquired = acquireSessionLease(workspaceRoot, route.primary.engine, resumeSessionId, jobId);
+    if (!leaseAcquired) {
+      throw new Error(
+        `Session "${resumeSessionId}" (${route.primary.engine}) already has an active writer; use a fresh session or an engine supporting fork.`
+      );
+    }
+    leasedEngine = route.primary.engine;
+    leasedSessionId = resumeSessionId;
+  }
+
+  let worktree = null;
+  let effectiveCwd = workspaceRoot;
 
   try {
+    if (useWorktree) {
+      if (resumeSessionId && sessionEntry?.hadWorktree) {
+        const canReuseOriginal =
+          !willFork &&
+          sessionEntry.worktreePath &&
+          isInsideManagedWorktree(sessionEntry.worktreePath) &&
+          fs.existsSync(sessionEntry.worktreePath) &&
+          isGitRepo(sessionEntry.worktreePath);
+
+        if (canReuseOriginal) {
+          worktree = {
+            worktreeId: sessionEntry.worktreeId || path.basename(sessionEntry.worktreePath),
+            repoRoot: workspaceRoot,
+            worktreePath: sessionEntry.worktreePath,
+            branch: null,
+            baseSha: sessionEntry.baseSha || getGitHeadSha(workspaceRoot),
+            reused: true
+          };
+          appendJobLog(logFile, `Reusing bound worktree at ${worktree.worktreePath} (base=${worktree.baseSha})`);
+        } else if (sessionEntry.patchPath && fs.existsSync(sessionEntry.patchPath) && sessionEntry.baseSha) {
+          worktree = createIsolatedWorktree(workspaceRoot, {
+            id: `${role}-${jobId}`.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 72),
+            branch: params.worktreeBranch || null,
+            baseSha: sessionEntry.baseSha
+          });
+          try {
+            applyPatchToWorktree(worktree.worktreePath, sessionEntry.patchPath);
+            appendJobLog(logFile, `Replayed prior patch ${sessionEntry.patchPath} onto worktree ${worktree.worktreePath}`);
+          } catch (replayErr) {
+            removeIsolatedWorktree(workspaceRoot, worktree.worktreePath);
+            throw replayErr;
+          }
+        } else {
+          throw new Error(
+            `Cannot resume write session "${resumeSessionId}": bound worktree (${sessionEntry.worktreePath || "none"}) and patch (${sessionEntry.patchPath || "none"}) are unavailable; start a fresh session or apply prior changes first.`
+          );
+        }
+      } else {
+        worktree = createIsolatedWorktree(workspaceRoot, {
+          id: `${role}-${jobId}`.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 72),
+          branch: params.worktreeBranch || null
+        });
+        appendJobLog(logFile, `Created isolated worktree at ${worktree.worktreePath} (base=${worktree.baseSha})`);
+      }
+      effectiveCwd = worktree.worktreePath;
+    } else if (resumeSessionId && sessionCwd && fs.existsSync(sessionCwd)) {
+      effectiveCwd = sessionCwd;
+    }
+
+    upsertJob(workspaceRoot, {
+      id: jobId,
+      kind: "run",
+      workflowId,
+      role,
+      mode,
+      status: "running",
+      engine: route.primary.engine,
+      model: route.primary.model,
+      effort: route.primary.effort,
+      worktreePath: worktree?.worktreePath ?? null,
+      logFile,
+      startedAt: nowIso()
+    });
+
     let handoffInfo = null;
     let fullPrompt = cleanPrompt;
     let ownedFiles = Array.isArray(params.ownedFiles) ? [...params.ownedFiles] : [];
@@ -344,16 +438,20 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
       fullPrompt = `${renderHandoffMarkdown(loaded)}\n\n${fullPrompt}`;
     } else if (
       params.handoff ||
+      params.parentHandoffId ||
       params.includeHostDigest ||
       params.includeAgyDigest ||
       params.includeRepoHandoff ||
       params.includeBoardDigest ||
       ownedFiles.length > 0 ||
       params.invariants?.length ||
+      params.decisionsMade?.length ||
+      params.doNotRelitigate?.length ||
       params.acceptanceCriteria?.length ||
       worktree
     ) {
       handoffInfo = createHandoffPacket(workspaceRoot, {
+        parentHandoffId: params.parentHandoffId ?? null,
         workflowId,
         boardId: params.boardId || workflowId,
         fromHost: host,
@@ -367,6 +465,8 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
         invariants: params.invariants ?? [],
         decisionsMade: params.decisionsMade ?? [],
         doNotRelitigate: params.doNotRelitigate ?? [],
+        supersededDecisions: params.supersededDecisions ?? [],
+        deprecatedInvariants: params.deprecatedInvariants ?? [],
         openQuestions: params.openQuestions ?? [],
         verification: params.verification ?? [],
         contextDigest: params.contextDigest ?? "",
@@ -382,37 +482,6 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
       if (bDigest) {
         fullPrompt = `<BOARD_CONTINUITY>\n${bDigest}\n</BOARD_CONTINUITY>\n\n${fullPrompt}`;
       }
-    }
-
-    let resumeSessionId = params.resumeSessionId || null;
-    let sessionCwd = null;
-    if (!resumeSessionId && params.resumeRole) {
-      const entry = lookupRoleSession(workspaceRoot, {
-        workflowId,
-        role,
-        engine: route.primary.engine
-      });
-      if (entry?.sessionId) {
-        resumeSessionId = entry.sessionId;
-        sessionCwd = entry.sessionCwd ?? null;
-      }
-    }
-
-    if (!worktree && resumeSessionId && sessionCwd && fs.existsSync(sessionCwd)) {
-      effectiveCwd = sessionCwd;
-    }
-
-    // Only Claude and Codex actually fork sessions; agy always requires single-writer lease.
-    const willFork = Boolean(params.forkSession) && (route.primary.engine === "claude" || route.primary.engine === "codex");
-    if (resumeSessionId && !willFork) {
-      leaseAcquired = acquireSessionLease(workspaceRoot, route.primary.engine, resumeSessionId, jobId);
-      if (!leaseAcquired) {
-        throw new Error(
-          `Session "${resumeSessionId}" (${route.primary.engine}) already has an active writer; use a fresh session or an engine supporting fork.`
-        );
-      }
-      leasedEngine = route.primary.engine;
-      leasedSessionId = resumeSessionId;
     }
 
     const onProgress = (msg) => appendJobLog(logFile, msg);
@@ -483,6 +552,8 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
 
     let worktreeDiff = {
       hasChanges: false,
+      deliverableMode: "none",
+      ignoredOnlyDeliverables: false,
       captureComplete: true,
       error: null,
       changedFiles: [],
@@ -499,11 +570,16 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
       if (auditedFiles.length > 0) {
         scopeViolations = auditFileScope(auditedFiles, { ownedFiles, forbiddenFiles });
       }
-      if (worktreeDiff.captureComplete && !worktreeDiff.hasChanges && params.keepEmptyWorktree !== true) {
+      if (worktreeDiff.captureComplete && !worktreeDiff.hasChanges && !worktree.reused && params.keepEmptyWorktree !== true) {
         removeIsolatedWorktree(workspaceRoot, worktree.worktreePath);
         appendJobLog(logFile, "Removed empty worktree (no file changes).");
       }
     }
+
+    const retainedWorktreePath =
+      worktree && (worktreeDiff.hasChanges || worktree.reused || !worktreeDiff.captureComplete || params.keepEmptyWorktree)
+        ? worktree.worktreePath
+        : null;
 
     if (finalResult?.sessionId) {
       recordRoleSession(workspaceRoot, {
@@ -513,7 +589,12 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
         sessionId: finalResult.sessionId,
         sessionCwd: effectiveCwd,
         model: finalResult.model || usedTarget.model,
-        effort: usedTarget.effort
+        effort: usedTarget.effort,
+        worktreeId: worktree?.worktreeId ?? null,
+        worktreePath: retainedWorktreePath,
+        baseSha: worktree?.baseSha ?? null,
+        patchPath: worktreeDiff.patchPath,
+        finalHeadSha: worktreeDiff.finalHeadSha
       });
     }
 
@@ -548,13 +629,12 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
       },
       handoffId: handoffInfo?.packet?.handoffId ?? null,
       handoffMdPath: handoffInfo?.mdPath ?? null,
-      worktreePath:
-        worktree && (worktreeDiff.hasChanges || !worktreeDiff.captureComplete || params.keepEmptyWorktree)
-          ? worktree.worktreePath
-          : null,
+      worktreePath: retainedWorktreePath,
       baseSha: worktree?.baseSha ?? null,
       finalHeadSha: worktreeDiff.finalHeadSha,
       patchPath: worktreeDiff.patchPath,
+      deliverableMode: worktreeDiff.deliverableMode ?? "none",
+      ignoredOnlyDeliverables: Boolean(worktreeDiff.ignoredOnlyDeliverables),
       diffStat: worktreeDiff.diffStat,
       changedFiles: worktreeDiff.changedFiles.length ? worktreeDiff.changedFiles : finalResult?.touchedFiles ?? [],
       ignoredFiles: worktreeDiff.ignoredFiles ?? [],
@@ -778,12 +858,65 @@ function mergeDualFindings(findingsLists) {
       merged.push({ ...item });
     }
   }
-  return merged.sort((a, b) => severityScore(a.severity) - severityScore(b.severity));
+  const sorted = merged.sort((a, b) => severityScore(a.severity) - severityScore(b.severity));
+  return sorted.map((item, idx) => ({ id: `F${idx + 1}`, ...item }));
+}
+
+export function inspectReviewArtifact(cwd, { reviewId, offset = 0, limit = 10, severity = null } = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const safeId = validateOpaqueId(reviewId, "reviewId");
+  const artifact = loadReviewArtifact(workspaceRoot, safeId);
+  if (!artifact) {
+    throw new Error(`Review artifact "${safeId}" not found.`);
+  }
+  const allFindings = Array.isArray(artifact.findings) ? artifact.findings : [];
+  let filtered = allFindings;
+  if (severity) {
+    const sLower = String(severity).trim().toLowerCase();
+    if (sLower === "blocking") {
+      filtered = allFindings.filter((f) => isBlockingSeverity(f.severity));
+    } else if (sLower === "advisory") {
+      filtered = allFindings.filter((f) => !isBlockingSeverity(f.severity));
+    } else {
+      filtered = allFindings.filter((f) => String(f.severity).toLowerCase() === sLower);
+    }
+  }
+  const safeOffset = Math.max(0, Math.trunc(Number(offset) || 0));
+  const safeLimit = Math.max(1, Math.min(50, Math.trunc(Number(limit) || 10)));
+  const page = filtered.slice(safeOffset, safeOffset + safeLimit);
+  const nextOffset = safeOffset + page.length;
+  const hasMore = nextOffset < filtered.length;
+  return {
+    ok: true,
+    reviewId: safeId,
+    verdict: artifact.verdict,
+    decision: artifact.decision ?? null,
+    gateKey: artifact.gateKey ?? null,
+    cycleId: artifact.cycleId ?? null,
+    round: artifact.round ?? null,
+    target: artifact.target,
+    artifactDigest: artifact.artifactDigest ?? null,
+    totalFindings: allFindings.length,
+    filteredTotal: filtered.length,
+    blockingCount: artifact.blockingCount ?? allFindings.filter((f) => isBlockingSeverity(f.severity)).length,
+    advisoryCount: artifact.advisoryCount ?? allFindings.filter((f) => !isBlockingSeverity(f.severity)).length,
+    offset: safeOffset,
+    limit: safeLimit,
+    hasMore,
+    findings: page,
+    ...(hasMore
+      ? { nextRecall: `relay_review(action="inspect", reviewId="${safeId}", offset=${nextOffset}, limit=${safeLimit}${severity ? `, severity="${severity}"` : ""})` }
+      : {})
+  };
 }
 
 export async function runDualReview(cwd, params = {}, internalOpts = {}) {
   assertRecursionSafe(cwd);
   validateCallerArgs(params);
+
+  if (params.action === "inspect" || params.reviewId) {
+    return inspectReviewArtifact(cwd, params);
+  }
 
   const signal = internalOpts.signal ?? null;
   const workspaceRoot = resolveWorkspaceRoot(cwd);
@@ -839,6 +972,11 @@ export async function runDualReview(cwd, params = {}, internalOpts = {}) {
     sensitivePatterns.some((pat) => f.toLowerCase().includes(pat.toLowerCase()))
   );
   const effectiveEffort = params.effort || (touchesSensitive ? "xhigh" : "high");
+  const artifactDigest = createHash("sha256")
+    .update(`${diffCtx.targetLabel}\n${diffCtx.status}\n${diffCtx.diff}`)
+    .digest("hex")
+    .slice(0, 16);
+  const reviewId = generateId("rev");
 
   const reviewPrompt = [
     "Perform a strict, adversarial code review of the changes below using two severity tiers:",
@@ -901,14 +1039,21 @@ export async function runDualReview(cwd, params = {}, internalOpts = {}) {
     verdict = needsAttention ? "needs-attention" : "approve";
   }
 
-  return {
+  const blockingCount = mergedFindings.filter((f) => isBlockingSeverity(f.severity)).length;
+  const advisoryCount = mergedFindings.length - blockingCount;
+  const payload = {
     ok: allSucceededWithSchema,
+    reviewId,
     engine: rawEngine,
     enginesUsed: targetEngines,
     effort: effectiveEffort,
     sensitiveUpgrade: touchesSensitive && !params.effort,
     target: diffCtx.targetLabel,
+    artifactDigest,
     verdict,
+    totalFindings: mergedFindings.length,
+    blockingCount,
+    advisoryCount,
     findings: mergedFindings,
     reviews: results.map((r) => ({
       engine: r.engine,
@@ -922,11 +1067,17 @@ export async function runDualReview(cwd, params = {}, internalOpts = {}) {
       error: r.error
     }))
   };
+  const artifactPath = saveReviewArtifact(workspaceRoot, reviewId, payload);
+  return { ...payload, artifactPath };
 }
 
 export async function runReviewGate(cwd, params = {}) {
   assertRecursionSafe(cwd);
   validateCallerArgs(params);
+
+  if (params.action === "inspect" || params.reviewId) {
+    return inspectReviewArtifact(cwd, params);
+  }
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const routing = loadRoutingConfig();
@@ -934,26 +1085,64 @@ export async function runReviewGate(cwd, params = {}) {
   const maxRounds = Math.max(1, Math.min(5, Number(params.maxRounds ?? routing.defaults?.maxReviewGateRounds ?? 2)));
 
   if (params.reset) {
-    saveReviewGateState(workspaceRoot, gateKey, { gateKey, round: 0, history: [] });
+    saveReviewGateState(workspaceRoot, gateKey, {
+      gateKey,
+      cycleNumber: 0,
+      cycleId: null,
+      status: "passed",
+      round: 0,
+      history: [],
+      completedCycles: []
+    });
     return { ok: true, gateKey, reset: true, round: 0 };
   }
 
-  // Reserve round number atomically BEFORE executing review so concurrent calls cannot overwrite each other.
+  // Reserve round number atomically BEFORE executing review. A passed cycle
+  // automatically closes and rolls into a fresh cycle instead of falsely escalating.
   const reservation = withReviewGateLock(workspaceRoot, gateKey, (state, save) => {
+    const startFreshCycle = !state.cycleId || state.status === "passed";
+    if (startFreshCycle) {
+      const completedCycles = Array.isArray(state.completedCycles) ? [...state.completedCycles] : [];
+      if (state.cycleId) {
+        completedCycles.push({
+          cycleId: state.cycleId,
+          cycleNumber: state.cycleNumber || completedCycles.length + 1,
+          status: state.status || "passed",
+          roundsUsed: state.round || 0,
+          closedAt: nowIso()
+        });
+      }
+      const nextCycleNum = (state.cycleNumber || 0) + 1;
+      const nextCycleId = generateId("cyc");
+      save({
+        gateKey,
+        cycleNumber: nextCycleNum,
+        cycleId: nextCycleId,
+        status: "open",
+        round: 1,
+        history: [],
+        completedCycles: completedCycles.slice(-10)
+      });
+      return { escalated: false, round: 1, cycleId: nextCycleId, cycleNumber: nextCycleNum };
+    }
+
     const nextRound = (state.round || 0) + 1;
     if (nextRound > maxRounds) {
       const lastEntry = state.history?.at(-1) ?? {};
       const remainingBlocking = (lastEntry.findings ?? []).filter((f) => isBlockingSeverity(f.severity));
+      save({ ...state, status: "escalated" });
       return { escalated: true, state, remainingBlocking };
     }
-    save({ ...state, gateKey, round: nextRound });
-    return { escalated: false, round: nextRound };
+    save({ ...state, gateKey, status: "open", round: nextRound });
+    return { escalated: false, round: nextRound, cycleId: state.cycleId, cycleNumber: state.cycleNumber || 1 };
   });
 
   if (reservation.escalated) {
     return {
       ok: false,
       gateKey,
+      cycleId: reservation.state.cycleId ?? null,
+      cycleNumber: reservation.state.cycleNumber ?? 1,
       decision: "escalate_to_user",
       round: reservation.state.round,
       maxRounds,
@@ -980,6 +1169,8 @@ export async function runReviewGate(cwd, params = {}) {
       ...(latest.history ?? []),
       {
         round: reservation.round,
+        reviewId: review.reviewId,
+        artifactDigest: review.artifactDigest,
         timestamp: nowIso(),
         decision,
         verdict: review.verdict,
@@ -987,17 +1178,46 @@ export async function runReviewGate(cwd, params = {}) {
         findings: review.findings
       }
     ].sort((a, b) => (a.round ?? 0) - (b.round ?? 0));
-    save({ gateKey, round: Math.max(latest.round || 0, reservation.round), history });
+    save({
+      gateKey,
+      cycleId: reservation.cycleId,
+      cycleNumber: reservation.cycleNumber,
+      status: decision === "pass" ? "passed" : "open",
+      round: Math.max(latest.round || 0, reservation.round),
+      history,
+      completedCycles: latest.completedCycles ?? []
+    });
   });
+
+  if (review.reviewId) {
+    const saved = loadReviewArtifact(workspaceRoot, review.reviewId) || {};
+    saveReviewArtifact(workspaceRoot, review.reviewId, {
+      ...saved,
+      decision,
+      gateKey,
+      cycleId: reservation.cycleId,
+      cycleNumber: reservation.cycleNumber,
+      round: reservation.round,
+      maxRounds
+    });
+  }
 
   return {
     ok: decision === "pass",
+    reviewId: review.reviewId,
+    artifactPath: review.artifactPath,
+    artifactDigest: review.artifactDigest,
     gateKey,
+    cycleId: reservation.cycleId,
+    cycleNumber: reservation.cycleNumber,
     decision,
     round: reservation.round,
     maxRounds,
     effort: review.effort,
     sensitiveUpgrade: review.sensitiveUpgrade,
+    totalFindings: review.findings.length,
+    blockingCount: blockingFindings.length,
+    advisoryCount: advisoryFindings.length,
     blockingFindings,
     advisoryFindings,
     reviews: review.reviews
@@ -1348,9 +1568,19 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
         });
         const compiled = buildWorkerResultToHandoff(workspaceRoot, lastResult, {
           workflowId,
+          boardId,
+          includeBoardDigest: Boolean(boardId),
           toEngine: nextRoute.primary.engine,
           role: stage.role || `stage-${i + 1}`,
-          goal: stage.goal || stage.prompt
+          goal: stage.goal || stage.prompt,
+          ownedFiles: stage.ownedFiles ?? [],
+          forbiddenFiles: stage.forbiddenFiles ?? ["docs/handoff.md"],
+          invariants: stage.invariants ?? [],
+          decisionsMade: stage.decisionsMade ?? [],
+          doNotRelitigate: stage.doNotRelitigate ?? [],
+          supersededDecisions: stage.supersededDecisions ?? [],
+          deprecatedInvariants: stage.deprecatedInvariants ?? [],
+          acceptanceCriteria: stage.acceptanceCriteria ?? []
         });
         currentHandoffId = compiled.packet.handoffId;
       }

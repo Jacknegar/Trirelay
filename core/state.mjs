@@ -135,7 +135,23 @@ export function loadSessionLedger(cwd) {
   return readJsonSafe(sessionLedgerPath(cwd), { entries: {}, leases: {} });
 }
 
-export function recordRoleSession(cwd, { workflowId = "default", role, engine, sessionId, sessionCwd = null, model = null, effort = null }) {
+export function recordRoleSession(
+  cwd,
+  {
+    workflowId = "default",
+    role,
+    engine,
+    sessionId,
+    sessionCwd = null,
+    model = null,
+    effort = null,
+    worktreeId = null,
+    worktreePath = null,
+    baseSha = null,
+    patchPath = null,
+    finalHeadSha = null
+  }
+) {
   if (!role || !engine || !sessionId) {
     return;
   }
@@ -144,6 +160,7 @@ export function recordRoleSession(cwd, { workflowId = "default", role, engine, s
     const ledger = readJsonSafe(file, { entries: {}, leases: {} });
     ledger.entries = ledger.entries || {};
     const key = `${workflowId}::${role}::${engine}`;
+    const prev = ledger.entries[key] || {};
     ledger.entries[key] = {
       workflowId,
       role,
@@ -152,6 +169,12 @@ export function recordRoleSession(cwd, { workflowId = "default", role, engine, s
       sessionCwd,
       model,
       effort,
+      worktreeId: worktreeId ?? prev.worktreeId ?? null,
+      worktreePath: worktreePath ?? prev.worktreePath ?? null,
+      baseSha: baseSha ?? prev.baseSha ?? null,
+      patchPath: patchPath ?? prev.patchPath ?? null,
+      finalHeadSha: finalHeadSha ?? prev.finalHeadSha ?? null,
+      hadWorktree: Boolean(worktreePath || patchPath || prev.hadWorktree),
       updatedAt: nowIso()
     };
     writeJsonAtomic(file, ledger);
@@ -171,6 +194,15 @@ export function lookupRoleSession(cwd, { workflowId = "default", role, engine })
     return matches[0] ?? null;
   }
   return null;
+}
+
+export function lookupSessionById(cwd, { engine, sessionId }) {
+  if (!engine || !sessionId) return null;
+  const ledger = loadSessionLedger(cwd);
+  const matches = Object.values(ledger.entries ?? {})
+    .filter((entry) => entry.engine === engine && entry.sessionId === sessionId)
+    .sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
+  return matches[0] ?? null;
 }
 
 export function acquireSessionLease(cwd, engine, sessionId, ownerId) {
@@ -373,6 +405,97 @@ export function resolveBoardFile(cwd, boardId = "default") {
   return assertPathInside(boardsDir, path.join(boardsDir, `${safeId}.jsonl`), "boardFile");
 }
 
+export function resolveBoardPinsFile(cwd, boardId = "default") {
+  const safeId = validateOpaqueId(boardId || "default", "boardId");
+  const boardsDir = ensureSubdir(cwd, "boards");
+  return assertPathInside(boardsDir, path.join(boardsDir, `${safeId}.pins.json`), "boardPinsFile");
+}
+
+function isPinTag(tag) {
+  const t = String(tag ?? "").toLowerCase();
+  return t === "[decision]" || t === "[pin]" || t === "[blocker]";
+}
+
+function isRetireTag(tag) {
+  const t = String(tag ?? "").toLowerCase();
+  return t === "[unpin]" || t === "[resolve]";
+}
+
+function applyPinTransition(pins, record) {
+  const next = Array.isArray(pins) ? pins.map((p) => ({ ...p })) : [];
+  if (record.supersedes !== undefined && record.supersedes !== null && record.supersedes !== "") {
+    const target = String(record.supersedes);
+    for (const p of next) {
+      if (p.status === "active" && (String(p.seq) === target || (p.pinId && p.pinId === target))) {
+        p.status = isRetireTag(record.tag) ? "resolved" : "superseded";
+        p.supersededBySeq = record.seq;
+        p.supersededAt = record.timestamp;
+      }
+    }
+  }
+  if (isPinTag(record.tag)) {
+    next.push({
+      seq: record.seq,
+      ...(record.pinId ? { pinId: record.pinId } : {}),
+      timestamp: record.timestamp,
+      author: record.author,
+      tag: record.tag,
+      ...(record.mentions?.length ? { mentions: record.mentions } : {}),
+      text: record.text,
+      ...(record.handoffId ? { handoffId: record.handoffId } : {}),
+      ...(record.patchPath ? { patchPath: record.patchPath } : {}),
+      ...(record.model ? { model: record.model } : {}),
+      status: "active"
+    });
+  }
+  return next;
+}
+
+export function readActiveBoardPins(cwd, boardId = "default") {
+  const pinsFile = resolveBoardPinsFile(cwd, boardId);
+  if (fs.existsSync(pinsFile)) {
+    const data = readJsonSafe(pinsFile, { boardId, pins: [] });
+    return (Array.isArray(data.pins) ? data.pins : []).filter((p) => p.status === "active");
+  }
+  const boardFile = resolveBoardFile(cwd, boardId);
+  if (!fs.existsSync(boardFile)) {
+    return [];
+  }
+  // Self-heal missing index once from full .jsonl history so early pins are never lost.
+  const lines = fs.readFileSync(boardFile, "utf8").split(/\r?\n/).filter(Boolean);
+  let pins = [];
+  for (const line of lines) {
+    try {
+      const rec = JSON.parse(line);
+      pins = applyPinTransition(pins, rec);
+    } catch {
+      // Skip malformed line.
+    }
+  }
+  writeJsonAtomic(pinsFile, { boardId, updatedAt: nowIso(), pins });
+  return pins.filter((p) => p.status === "active");
+}
+
+export function readBoardPostsBySeqs(cwd, boardId = "default", seqs = []) {
+  const want = new Set((Array.isArray(seqs) ? seqs : []).map((n) => Number(n)).filter(Number.isFinite));
+  if (want.size === 0) return [];
+  const file = resolveBoardFile(cwd, boardId);
+  if (!fs.existsSync(file)) return [];
+  const lines = fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean);
+  const out = [];
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line);
+      if (want.has(Number(parsed.seq))) {
+        out.push(parsed);
+      }
+    } catch {
+      // Skip malformed line.
+    }
+  }
+  return out;
+}
+
 export function readBoardPosts(cwd, boardId = "default", { since = 0, limit = 100 } = {}) {
   const file = resolveBoardFile(cwd, boardId);
   if (!fs.existsSync(file)) {
@@ -405,9 +528,13 @@ export function readBoardPosts(cwd, boardId = "default", { since = 0, limit = 10
 export function postBoardMessage(cwd, boardId = "default", entry = {}) {
   const safeBoardId = validateOpaqueId(boardId || "default", "boardId");
   const file = resolveBoardFile(cwd, safeBoardId);
+  const pinsFile = resolveBoardPinsFile(cwd, safeBoardId);
   return withFileLockSync(file, () => {
-    const existing = readBoardPosts(cwd, safeBoardId, { since: 0, limit: 0 });
-    const nextSeq = (existing.at(-1)?.seq ?? 0) + 1;
+    let tail = readBoardPosts(cwd, safeBoardId, { since: 0, limit: 1 });
+    if (tail.length === 0 && fs.existsSync(file) && fs.statSync(file).size > 0) {
+      tail = readBoardPosts(cwd, safeBoardId, { since: 0, limit: 0 });
+    }
+    const nextSeq = (tail.at(-1)?.seq ?? 0) + 1;
     const text = String(entry.text ?? "").trim();
     const mentions = Array.isArray(entry.mentions)
       ? entry.mentions
@@ -420,6 +547,10 @@ export function postBoardMessage(cwd, boardId = "default", entry = {}) {
       tag: entry.tag ?? "[update]",
       mentions,
       text,
+      ...(entry.pinId ? { pinId: String(entry.pinId) } : {}),
+      ...(entry.supersedes !== undefined && entry.supersedes !== null && entry.supersedes !== ""
+        ? { supersedes: entry.supersedes }
+        : {}),
       ...(entry.handoffId ? { handoffId: entry.handoffId } : {}),
       ...(entry.patchPath ? { patchPath: entry.patchPath } : {}),
       ...(entry.sessionId ? { sessionId: entry.sessionId } : {}),
@@ -427,6 +558,26 @@ export function postBoardMessage(cwd, boardId = "default", entry = {}) {
     };
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     fs.appendFileSync(file, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+
+    // Keep dedicated active pins index updated atomically alongside the append log.
+    if (isPinTag(record.tag) || isRetireTag(record.tag) || record.supersedes !== undefined) {
+      let existingPins;
+      if (fs.existsSync(pinsFile)) {
+        existingPins = readJsonSafe(pinsFile, { boardId: safeBoardId, pins: [] }).pins;
+      } else {
+        const allLines = fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean);
+        existingPins = [];
+        for (let i = 0; i < allLines.length - 1; i += 1) {
+          try {
+            existingPins = applyPinTransition(existingPins, JSON.parse(allLines[i]));
+          } catch {
+            // Ignore malformed line.
+          }
+        }
+      }
+      const updatedPins = applyPinTransition(existingPins, record);
+      writeJsonAtomic(pinsFile, { boardId: safeBoardId, updatedAt: nowIso(), pins: updatedPins });
+    }
     return record;
   });
 }
@@ -492,4 +643,25 @@ export function withReviewGateLock(cwd, gateKey, fn) {
       return nextState;
     });
   });
+}
+
+// --- Immutable Review Artifacts ---
+
+export function resolveReviewArtifactFile(cwd, reviewId) {
+  const safeId = validateOpaqueId(reviewId, "reviewId");
+  const dir = ensureSubdir(cwd, "reviews");
+  return assertPathInside(dir, path.join(dir, `${safeId}.json`), "reviewArtifactFile");
+}
+
+export function saveReviewArtifact(cwd, reviewId, payload) {
+  const file = resolveReviewArtifactFile(cwd, reviewId);
+  return withFileLockSync(file, () => {
+    writeJsonAtomic(file, { ...payload, reviewId, updatedAt: nowIso() });
+    return file;
+  });
+}
+
+export function loadReviewArtifact(cwd, reviewId) {
+  const file = resolveReviewArtifactFile(cwd, reviewId);
+  return readJsonSafe(file, null);
 }

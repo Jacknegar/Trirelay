@@ -45,7 +45,8 @@ export function isPreDispatchFailure({ errorText = "", hasStartedTurn = false, t
 
 /**
  * Spawn a CLI subprocess in its own process group (on POSIX) with timeout
- * escalation (SIGTERM -> SIGKILL after 3s) and optional stdin payload.
+ * escalation (SIGTERM -> SIGKILL after killGraceMs), stdin EPIPE protection,
+ * and forced group cleanup + settlement even if grandchildren outlive the parent CLI.
  */
 export function spawnJsonlProcess({
   bin,
@@ -54,12 +55,14 @@ export function spawnJsonlProcess({
   engine,
   stdinText = null,
   timeoutMs = 600000,
+  killGraceMs = 1500,
   signal = null,
   onLine = null,
   onStderr = null
 }) {
   return new Promise((resolve) => {
     const useProcessGroup = process.platform !== "win32";
+    const graceMs = Math.max(100, Math.min(3000, Number.isFinite(Number(killGraceMs)) ? Number(killGraceMs) : 1500));
     const env = buildWorkerEnv(process.env, {
       depth: getRecursionDepth() + 1,
       engine
@@ -75,35 +78,78 @@ export function spawnJsonlProcess({
 
     let stdoutBuf = "";
     let stderr = "";
+    let stdinError = null;
+    let processExited = false;
+    let exitCode = null;
     let timedOut = false;
     let aborted = false;
+    let terminating = false;
     let settled = false;
     let forceKillTimer = null;
+    let finalSettleTimer = null;
+
+    function destroyStreams() {
+      try { proc.stdin?.destroy(); } catch {}
+      try { proc.stdout?.destroy(); } catch {}
+      try { proc.stderr?.destroy(); } catch {}
+    }
+
+    function cleanup() {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (finalSettleTimer) clearTimeout(finalSettleTimer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    }
+
+    function finalize(codeOverride = undefined) {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const tail = stdoutBuf.trim();
+      if (tail) {
+        onLine?.(tail);
+      }
+      resolve({
+        code: codeOverride !== undefined ? codeOverride : exitCode,
+        spawnError: null,
+        timedOut,
+        aborted,
+        stdinError: stdinError ? (stdinError.message || String(stdinError)) : null,
+        stderr,
+        trailingStdout: tail
+      });
+    }
 
     function terminateTree() {
-      if (!proc || proc.exitCode !== null) return;
+      if (terminating || settled) return;
+      terminating = true;
+
+      // Signal the entire process group even if the lead CLI already exited while
+      // orphaned descendant workers/tools still hold stdio pipes open.
       try {
         if (useProcessGroup && proc.pid) {
           process.kill(-proc.pid, "SIGTERM");
-        } else {
+        } else if (!processExited) {
           proc.kill("SIGTERM");
         }
       } catch {
-        // Ignore already-exited process.
+        // Ignore ESRCH when process/group already exited.
       }
+
       forceKillTimer = setTimeout(() => {
-        if (proc.exitCode === null) {
-          try {
-            if (useProcessGroup && proc.pid) {
-              process.kill(-proc.pid, "SIGKILL");
-            } else {
-              proc.kill("SIGKILL");
-            }
-          } catch {
-            // Ignore.
+        try {
+          if (useProcessGroup && proc.pid) {
+            process.kill(-proc.pid, "SIGKILL");
+          } else if (!processExited) {
+            proc.kill("SIGKILL");
           }
+        } catch {
+          // Ignore ESRCH.
         }
-      }, 3000);
+        destroyStreams();
+        finalSettleTimer = setTimeout(() => finalize(exitCode), 250);
+        finalSettleTimer.unref?.();
+      }, graceMs);
       forceKillTimer.unref?.();
     }
 
@@ -128,10 +174,11 @@ export function spawnJsonlProcess({
       }
     }
 
-    function cleanup() {
-      if (timeoutTimer) clearTimeout(timeoutTimer);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
-      if (signal) signal.removeEventListener("abort", onAbort);
+    if (proc.stdin) {
+      proc.stdin.on("error", (err) => {
+        // Early-exit children close stdin before reading large prompts (EPIPE / ERR_STREAM_DESTROYED).
+        stdinError = err;
+      });
     }
 
     proc.stdout.setEncoding("utf8");
@@ -155,6 +202,11 @@ export function spawnJsonlProcess({
       onStderr?.(chunk);
     });
 
+    proc.on("exit", (code) => {
+      processExited = true;
+      exitCode = code;
+    });
+
     proc.on("error", (err) => {
       if (settled) return;
       settled = true;
@@ -164,31 +216,22 @@ export function spawnJsonlProcess({
         spawnError: err,
         timedOut,
         aborted,
+        stdinError: stdinError ? (stdinError.message || String(stdinError)) : null,
         stderr,
         trailingStdout: stdoutBuf.trim()
       });
     });
 
     proc.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      const tail = stdoutBuf.trim();
-      if (tail) {
-        onLine?.(tail);
-      }
-      resolve({
-        code,
-        spawnError: null,
-        timedOut,
-        aborted,
-        stderr,
-        trailingStdout: tail
-      });
+      finalize(code ?? exitCode);
     });
 
     if (stdinText !== null && proc.stdin) {
-      proc.stdin.end(String(stdinText));
+      try {
+        proc.stdin.end(String(stdinText));
+      } catch (err) {
+        stdinError = err;
+      }
     }
   });
 }

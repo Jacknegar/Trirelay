@@ -19,13 +19,13 @@ Use the `trirelay` MCP tools (preferring eager core tools directly without readi
 - `relay_setup`: `{ cwd?, host?: "agy"|"claude"|"codex"|"cli" }`
 - `relay_models`: `{ includeHidden?, includeAgyProbe? }`
 - `relay_route`: `{ host?, excludeHost?, profile?, spec?, engine?, model?, effort?, mode?, authorEngine?, strict? }`
-- `relay_run`: `{ prompt, cwd?, host?, background?, role?, workflowId?, boardId?, profile?, spec?, engine?, model?, effort?, mode?: "readonly"|"write", ownedFiles?, forbiddenFiles?, invariants?, acceptanceCriteria?, handoffId?, handoff?, includeHostDigest?, includeRepoHandoff?, includeBoardDigest?, resumeRole?, resumeSessionId?, forkSession?, outputSchema?, timeoutMs? }`
-- `relay_review`: `{ cwd?, host?, background?, engine?: "both"|"agy"|"claude"|"codex", scope?: "auto"|"working-tree"|"branch", base?, focus?, model?, effort?, native? }`
-- `relay_review_gate`: `{ cwd?, host?, gateKey?, workflowId?, maxRounds?: 2, reset?, engine?, scope?, base?, focus?, effort? }`
+- `relay_run`: `{ prompt, cwd?, host?, background?, role?, workflowId?, boardId?, profile?, spec?, engine?, model?, effort?, mode?: "readonly"|"write", ownedFiles?, forbiddenFiles?, invariants?, decisionsMade?, doNotRelitigate?, acceptanceCriteria?, handoffId?, parentHandoffId?, handoff?, includeHostDigest?, includeRepoHandoff?, includeBoardDigest?, resumeRole?, resumeSessionId?, forkSession?, outputSchema?, timeoutMs? }`
+- `relay_review`: `{ action?: "run"|"inspect", reviewId?, offset?, limit?, severity?, cwd?, host?, background?, engine?: "both"|"agy"|"claude"|"codex", scope?: "auto"|"working-tree"|"branch", base?, focus?, model?, effort?, native? }`
+- `relay_review_gate`: `{ action?: "run"|"inspect", reviewId?, offset?, limit?, severity?, cwd?, host?, gateKey?, workflowId?, maxRounds?: 2, reset?, engine?, scope?, base?, focus?, effort? }`
 - `relay_design`: `{ action: "start"|"submit_host"|"reveal", cwd?, host?, background?, designId?, requirement?, contextPaths?, advisorSpec?, hostDraft?, hostDraftPath? }`
 - `relay_copy_review`: `{ cwd?, host?, content?, filePath?, audience?, purpose?, advisorSpec?, workflowId? }`
 - `relay_orchestrate`: `{ pattern: "teamwork"|"boost"|"swarm"|"pipeline", cwd?, host?, background?, workflowId?, boardId?, goal?, prompt?, models?, crossCritique?, crossVerify?, tasks?, workers?, stages?, maxConcurrency?, maxPerEngine? }`
 - `relay_apply`: `{ jobId, cwd?, mode?: "check"|"apply" }`
-- `relay_handoff`: `{ action: "create"|"inspect"|"list_claude_sessions", cwd?, handoffId?, workflowId?, toEngine?, role?, goal?, ownedFiles?, forbiddenFiles?, invariants?, decisionsMade?, doNotRelitigate?, evidence?, acceptanceCriteria?, includeHostDigest?, includeRepoHandoff?, includeBoardDigest? }`
-- `relay_board`: `{ action: "read"|"post", cwd?, boardId?, view?: "tiered"|"full", since?, limit?, author?, tag?, text? }`
+- `relay_handoff`: `{ action: "create"|"inspect"|"list_claude_sessions", cwd?, handoffId?, parentHandoffId?, workflowId?, toEngine?, role?, goal?, ownedFiles?, forbiddenFiles?, invariants?, decisionsMade?, doNotRelitigate?, supersededDecisions?, deprecatedInvariants?, evidence?, acceptanceCriteria?, includeHostDigest?, includeRepoHandoff?, includeBoardDigest? }`
+- `relay_board`: `{ action: "read"|"post", cwd?, boardId?, view?: "tiered"|"full", pinsOnly?, seqs?, pinId?, supersedes?, since?, limit?, author?, tag?, text? }`
 - `relay_jobs`: `{ action?: "list"|"status"|"wait"|"result"|"cancel", cwd?, jobId?, waitTimeoutMs?, limit?, compact?: true }`

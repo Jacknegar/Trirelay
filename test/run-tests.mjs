@@ -88,7 +88,11 @@ const {
   truncateWithByteNotice
 } = await import("../core/compact.mjs");
 const {
+  spawnJsonlProcess
+} = await import("../core/drivers/common.mjs");
+const {
   assertRecursionSafe,
+  inspectReviewArtifact,
   runCopyReview,
   runDualDesign,
   runDualReview,
@@ -98,8 +102,8 @@ const {
   validateCallerArgs
 } = await import("../core/orchestrator.mjs");
 const { resolveRoute } = await import("../core/router.mjs");
-const { createHandoffPacket, loadHandoffPacket, renderHandoffMarkdown } = await import("../core/handoff.mjs");
-const { assertPathInside, postBoardMessage, readBoardPosts } = await import("../core/state.mjs");
+const { buildWorkerResultToHandoff, createHandoffPacket, loadHandoffPacket, renderHandoffMarkdown } = await import("../core/handoff.mjs");
+const { assertPathInside, postBoardMessage, readActiveBoardPins, readBoardPosts, readBoardPostsBySeqs } = await import("../core/state.mjs");
 const {
   applyWorktreePatch,
   auditFileScope,
@@ -749,6 +753,308 @@ function testInstallerDryRun() {
   console.log("[PASS] Installer dry-run plan");
 }
 
+async function testReleaseGateStateConsistencySuite() {
+  // R1 (P1 #1): Resumed write session stays bound to original worktree (or replays patch, or fails closed)
+  process.env.TRIRELAY_TEST_CREATE_FEATURE = "1";
+  const r1Turn1 = await runSingleTask(REPO_DIR, {
+    engine: "codex",
+    mode: "write",
+    workflowId: "wf-r1",
+    role: "impl-r1",
+    ownedFiles: ["src/**"],
+    prompt: "Create src/feature.txt"
+  });
+  assert.equal(r1Turn1.ok, true);
+  assert.ok(r1Turn1.worktreePath && fs.existsSync(path.join(r1Turn1.worktreePath, "src", "feature.txt")));
+
+  const r1Turn2 = await runSingleTask(REPO_DIR, {
+    engine: "codex",
+    mode: "write",
+    workflowId: "wf-r1",
+    role: "impl-r1",
+    resumeRole: true,
+    ownedFiles: ["src/**"],
+    prompt: "Modify src/feature.txt"
+  });
+  assert.equal(r1Turn2.ok, true);
+  assert.ok(r1Turn2.output.includes("hasFeature=true"), `Expected hasFeature=true in resumed write turn, got: ${r1Turn2.output}`);
+  assert.equal(r1Turn2.worktreePath, r1Turn1.worktreePath);
+  assert.ok(r1Turn2.patchPath && fs.readFileSync(r1Turn2.patchPath, "utf8").includes("turn2=ok"));
+
+  // Replay path: delete original worktree while keeping patch, then fork/resume -> replays patch cleanly
+  removeIsolatedWorktree(REPO_DIR, r1Turn1.worktreePath);
+  const r1Replay = await runSingleTask(REPO_DIR, {
+    engine: "codex",
+    mode: "write",
+    workflowId: "wf-r1",
+    role: "impl-r1",
+    resumeRole: true,
+    ownedFiles: ["src/**"],
+    prompt: "Continue after worktree cleanup"
+  });
+  assert.equal(r1Replay.ok, true);
+  assert.ok(r1Replay.output.includes("hasFeature=true"), `Expected patch replay to restore src/feature.txt, got: ${r1Replay.output}`);
+  assert.notEqual(r1Replay.worktreePath, r1Turn1.worktreePath);
+
+  // Fail-closed path: delete both worktree and patch -> explicit error instead of empty fresh worktree
+  removeIsolatedWorktree(REPO_DIR, r1Replay.worktreePath);
+  if (r1Replay.patchPath && fs.existsSync(r1Replay.patchPath)) fs.unlinkSync(r1Replay.patchPath);
+  await assert.rejects(
+    () =>
+      runSingleTask(REPO_DIR, {
+        engine: "codex",
+        mode: "write",
+        workflowId: "wf-r1",
+        role: "impl-r1",
+        resumeRole: true,
+        ownedFiles: ["src/**"],
+        prompt: "Should fail closed"
+      }),
+    /bound worktree.*unavailable/i
+  );
+  delete process.env.TRIRELAY_TEST_CREATE_FEATURE;
+
+  // R2 (P1 #2): Pipeline multi-stage constraint inheritance + stage-local ownedFiles isolation + decision retirement
+  const initPipeHandoff = createHandoffPacket(REPO_DIR, {
+    workflowId: "wf-pipe-r2",
+    goal: "Stage 1 module A",
+    ownedFiles: ["src/app.js"],
+    invariants: ["DO_NOT_CHANGE_PRODUCTION"],
+    decisionsMade: ["Use algorithm A", "Keep interface clean"],
+    doNotRelitigate: ["Keep the selected architecture"]
+  });
+  const pipeRes = await runOrchestration(REPO_DIR, {
+    pattern: "pipeline",
+    workflowId: "wf-pipe-r2",
+    handoffId: initPipeHandoff.packet.handoffId,
+    stages: [
+      { engine: "claude", role: "s1", ownedFiles: ["src/app.js"], prompt: "Stage 1 work" },
+      {
+        engine: "codex",
+        role: "s2",
+        ownedFiles: ["src/auth.js"],
+        decisionsMade: ["Switch to algorithm B"],
+        supersededDecisions: ["Use algorithm A"],
+        prompt: "Stage 2 work"
+      },
+      { engine: "agy", role: "s3", prompt: "Stage 3 verify" }
+    ]
+  });
+  assert.equal(pipeRes.ok, true);
+  assert.equal(pipeRes.stages.length, 3);
+  const s2Packet = loadHandoffPacket(REPO_DIR, pipeRes.stages[1].handoffId);
+  assert.ok(s2Packet.invariants.includes("DO_NOT_CHANGE_PRODUCTION"));
+  assert.ok(s2Packet.doNotRelitigate.includes("Keep the selected architecture"));
+  assert.ok(s2Packet.decisionsMade.includes("Keep interface clean"));
+  assert.ok(s2Packet.decisionsMade.includes("Switch to algorithm B"));
+  assert.ok(!s2Packet.decisionsMade.includes("Use algorithm A"), "Superseded decision must be retired");
+  assert.deepEqual(s2Packet.scope.ownedFiles, ["src/auth.js"], "Stage 2 must NOT inherit Stage 1 ownedFiles");
+  const s3Packet = loadHandoffPacket(REPO_DIR, pipeRes.stages[2].handoffId);
+  assert.ok(s3Packet.invariants.includes("DO_NOT_CHANGE_PRODUCTION"));
+  assert.ok(s3Packet.decisionsMade.includes("Switch to algorithm B"));
+  assert.ok(!s3Packet.decisionsMade.includes("Use algorithm A"));
+  assert.deepEqual(s3Packet.scope.ownedFiles, [], "Stage 3 without ownedFiles must NOT inherit Stage 2 ownedFiles");
+
+  // R4 (P1 #4): Early-exit EPIPE does not crash host, and orphan grandchild pipe holders die & settle cleanly on timeout
+  const epipeRes = await spawnJsonlProcess({
+    bin: process.execPath,
+    args: ["-e", "process.exit(1)"],
+    cwd: REPO_DIR,
+    engine: "codex",
+    stdinText: "X".repeat(1024 * 1024),
+    timeoutMs: 5000
+  });
+  assert.equal(epipeRes.code, 1);
+
+  const orphanT0 = Date.now();
+  const orphanScript =
+    "const { spawn } = require('node:child_process'); " +
+    "spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: ['ignore', 1, 2] }); " +
+    "process.exit(0);";
+  const orphanRes = await spawnJsonlProcess({
+    bin: process.execPath,
+    args: ["-e", orphanScript],
+    cwd: REPO_DIR,
+    engine: "codex",
+    stdinText: null,
+    timeoutMs: 450,
+    killGraceMs: 250
+  });
+  const orphanElapsed = Date.now() - orphanT0;
+  assert.equal(orphanRes.timedOut, true);
+  assert.ok(orphanElapsed < 3500, `Orphan pipe timeout must converge quickly, took ${orphanElapsed}ms`);
+
+  // R5 (P2 #5): Long 520B pin preserved intact; pin at #1 survives 205 updates; pinsOnly/seqs/supersedes work cleanly
+  const r5BoardId = `pins-r5-${Date.now()}`;
+  const longPinTail = "END_INVARIANT_MUST_SURVIVE_520B";
+  const longPinText = `${"Constraint detail prefix ".repeat(20)} | ${longPinTail}`;
+  assert.ok(Buffer.byteLength(longPinText, "utf8") > 480);
+  postBoardMessage(REPO_DIR, r5BoardId, { author: "arch", tag: "[pin]", pinId: "pin-long", text: longPinText });
+  postBoardMessage(REPO_DIR, r5BoardId, { author: "arch", tag: "[decision]", pinId: "pin-old", text: "OLD_ALGO_X" });
+  for (let i = 0; i < 205; i += 1) {
+    postBoardMessage(REPO_DIR, r5BoardId, { author: "worker", tag: "[update]", text: `noise update ${i}` });
+  }
+  postBoardMessage(REPO_DIR, r5BoardId, {
+    author: "arch",
+    tag: "[decision]",
+    pinId: "pin-new",
+    supersedes: "pin-old",
+    text: "NEW_ALGO_Y"
+  });
+  const activePinsR5 = readActiveBoardPins(REPO_DIR, r5BoardId);
+  assert.equal(activePinsR5.length, 2);
+  assert.ok(activePinsR5.some((p) => p.text.includes(longPinTail)), "Long pin >400B must survive intact in pins index");
+  assert.ok(!activePinsR5.some((p) => p.text.includes("OLD_ALGO_X")), "Superseded pin must be inactive");
+  const recentPostsR5 = readBoardPosts(REPO_DIR, r5BoardId, { since: 0, limit: 100 });
+  const tieredR5 = buildTieredBoardView(recentPostsR5, { pinnedPosts: activePinsR5, boardId: r5BoardId, maxBytes: 2400 });
+  assert.ok(tieredR5.posts.some((p) => (p.text || "").includes(longPinTail)), "Tiered view must keep #1 long pin past 205 updates");
+
+  // Also test honest omission reporting when budget cannot fit all pins
+  const tightPins = buildTieredBoardView(recentPostsR5, { pinnedPosts: activePinsR5, boardId: r5BoardId, maxBytes: 420 });
+  assert.ok(tightPins.omittedPinnedCount > 0 || tightPins.truncatedPinnedSeqs.length > 0);
+  assert.ok(tightPins.recallHint.includes("pinsOnly=true"));
+  const seq1Lookup = readBoardPostsBySeqs(REPO_DIR, r5BoardId, [1]);
+  assert.equal(seq1Lookup.length, 1);
+  assert.ok(seq1Lookup[0].text.includes(longPinTail));
+
+  // R6 (P2 #6): Review gate opens a fresh cycle after PASS instead of escalating on 3rd approving call
+  fs.writeFileSync(path.join(REPO_DIR, "src", "auth.js"), "export function login() { return true; }\n");
+  delete process.env.TRIRELAY_TEST_REVIEW_BLOCKING;
+  const passGate = `cycle-pass-${Date.now()}`;
+  const g1 = await runReviewGate(REPO_DIR, { gateKey: passGate, engine: "claude", maxRounds: 2 });
+  const g2 = await runReviewGate(REPO_DIR, { gateKey: passGate, engine: "claude", maxRounds: 2 });
+  const g3 = await runReviewGate(REPO_DIR, { gateKey: passGate, engine: "claude", maxRounds: 2 });
+  assert.equal(g1.decision, "pass");
+  assert.equal(g2.decision, "pass");
+  assert.equal(g3.decision, "pass");
+  assert.equal(g3.cycleNumber, 3);
+  assert.equal(g3.round, 1);
+
+  // R7: Ignored-only worktree deliverable marked cleanly
+  fs.writeFileSync(path.join(REPO_DIR, ".gitignore"), "dist-ignored/\n");
+  runSync("git", ["add", ".gitignore"], { cwd: REPO_DIR });
+  runSync("git", ["commit", "-m", "ignore dist-ignored"], { cwd: REPO_DIR });
+  process.env.TRIRELAY_TEST_IGNORED_ONLY = "1";
+  const ignRes = await runSingleTask(REPO_DIR, {
+    engine: "codex",
+    mode: "write",
+    workflowId: "wf-ign",
+    role: "builder",
+    ownedFiles: ["dist-ignored/**"],
+    prompt: "Build ignored artifact only"
+  });
+  delete process.env.TRIRELAY_TEST_IGNORED_ONLY;
+  assert.equal(ignRes.ok, true);
+  assert.equal(ignRes.deliverableMode, "ignored-only");
+  assert.equal(ignRes.ignoredOnlyDeliverables, true);
+  assert.equal(ignRes.patchPath, null);
+  assert.ok(ignRes.worktreePath && fs.existsSync(ignRes.worktreePath), "Ignored-only deliverable must retain worktree");
+  removeIsolatedWorktree(REPO_DIR, ignRes.worktreePath);
+
+  // R3 (P1 #3) over real MCP server: 12 blocking findings (>32 KB) compact to <=8500B with actionable reviewId,
+  // blockingCount, blockingPreview, and paginated side-effect-free `inspect` (does NOT bump gate round!).
+  process.env.TRIRELAY_TEST_MANY_FINDINGS = "12";
+  const child = spawn(process.execPath, [path.join(PACKAGE_ROOT, "bin", "trirelay-mcp.mjs")], {
+    cwd: REPO_DIR,
+    env: process.env,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const resMap = new Map();
+  let buf = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    buf += chunk;
+    let idx = buf.indexOf("\n");
+    while (idx !== -1) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (line) {
+        const msg = JSON.parse(line);
+        if (msg.id !== undefined) resMap.set(msg.id, msg);
+      }
+      idx = buf.indexOf("\n");
+    }
+  });
+  const send = (m) => child.stdin.write(`${JSON.stringify(m)}\n`);
+  const waitForId = async (id, timeoutMs = 15000) => {
+    const start = Date.now();
+    while (!resMap.has(id)) {
+      if (Date.now() - start > timeoutMs) throw new Error(`MCP timeout id=${id}`);
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    return resMap.get(id);
+  };
+  try {
+    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } });
+    await waitForId(1);
+    const gateKeyR3 = `r3-gate-${Date.now()}`;
+    send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "relay_review_gate", arguments: { cwd: REPO_DIR, gateKey: gateKeyR3, engine: "claude", maxRounds: 2 } }
+    });
+    const revCall = await waitForId(2);
+    const rawText = revCall.result.content[0].text;
+    assert.ok(Buffer.byteLength(rawText, "utf8") <= 8500, "Oversized review gate must obey <=8500B inline cap");
+    const parsedRev = JSON.parse(rawText);
+    assert.equal(parsedRev._compacted, true);
+    assert.ok(parsedRev.reviewId, "Compacted review must preserve reviewId");
+    assert.equal(parsedRev.blockingCount, 12);
+    assert.ok(Array.isArray(parsedRev.blockingPreview) && parsedRev.blockingPreview.length > 0);
+    assert.ok(parsedRev._recall.includes(parsedRev.reviewId) && parsedRev._recall.includes("inspect"));
+
+    // Paginate ALL 12 findings via inspect without mutating gate round!
+    send({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "relay_review_gate", arguments: { cwd: REPO_DIR, action: "inspect", reviewId: parsedRev.reviewId, offset: 0, limit: 6 } }
+    });
+    const page1 = JSON.parse((await waitForId(3)).result.content[0].text);
+    assert.equal(page1.findings.length, 6);
+    assert.equal(page1.hasMore, true);
+    assert.equal(page1.round, 1);
+
+    send({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "relay_review_gate", arguments: { cwd: REPO_DIR, action: "inspect", reviewId: parsedRev.reviewId, offset: 6, limit: 6 } }
+    });
+    const page2 = JSON.parse((await waitForId(4)).result.content[0].text);
+    assert.equal(page2.findings.length, 6);
+    assert.equal(page2.hasMore, false);
+    assert.equal(page2.findings[5].id, "F12");
+
+    // Verify 2nd actual gate call is round 2 (NOT round 4 — inspect was side-effect-free!)
+    send({
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/call",
+      params: { name: "relay_review_gate", arguments: { cwd: REPO_DIR, gateKey: gateKeyR3, engine: "claude", maxRounds: 2 } }
+    });
+    const round2 = JSON.parse((await waitForId(5)).result.content[0].text);
+    assert.equal(round2.round, 2);
+
+    // Check full board view bypasses 100-post window
+    send({
+      jsonrpc: "2.0",
+      id: 6,
+      method: "tools/call",
+      params: { name: "relay_board", arguments: { cwd: REPO_DIR, boardId: r5BoardId, action: "read", view: "full" } }
+    });
+    const fullBoard = JSON.parse((await waitForId(6)).result.content[0].text);
+    assert.ok(fullBoard.posts.length >= 208, `Expected >=208 posts on view='full', got ${fullBoard.posts.length}`);
+  } finally {
+    delete process.env.TRIRELAY_TEST_MANY_FINDINGS;
+    child.stdin.end();
+    child.kill("SIGTERM");
+  }
+
+  console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables)");
+}
+
 async function main() {
   try {
     initTempGitRepo();
@@ -767,6 +1073,7 @@ async function main() {
     testSessionHookSnapshots();
     await testAsyncMcpServer();
     testInstallerDryRun();
+    await testReleaseGateStateConsistencySuite();
     console.log("ALL TRIRELAY TESTS PASSED");
   } finally {
     fs.rmSync(TMP_BASE, { recursive: true, force: true });
