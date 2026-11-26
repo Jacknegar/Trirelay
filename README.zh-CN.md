@@ -138,7 +138,7 @@ node ./scripts/benchmark.mjs --live
 
 ## 平台兼容说明
 
-- **实机验证**：Linux x64（本地测试环境 `Node v24.15.0`），已通过 16 组全量测试（含 R1–R7 与 B1–B7 闭环回归，[`test/run-tests.mjs`](test/run-tests.mjs)）、`agy plugin validate`（0 错误）和 `claude plugin validate --strict`（`success: true`，0 错误 0 警告）。
+- **实机验证**：Linux x64（本地测试环境 `Node v24.15.0`），已通过 16 组全量测试（含 R1–R26 与 B1–B7 闭环回归，[`test/run-tests.mjs`](test/run-tests.mjs)）、`agy plugin validate`（0 错误）和 `claude plugin validate --strict`（`success: true`，0 错误 0 警告）。
 - **CI 与 macOS 兼容说明**：GitHub Actions 已配置 `ubuntu-latest` 与 `macos-latest`（`Node 20` / `22`）工作流（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）；POSIX `sh`（含软链解析与 Homebrew/nvm/fnm/volta 路径发现）与标准 Node API 已做静态核对，但尚未在本地物理 macOS 硬件上实机执行。
 
 ## 致谢

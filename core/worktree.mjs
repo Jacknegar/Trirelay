@@ -97,6 +97,49 @@ export function createIsolatedWorktree(repoRoot, { id = null, branch = null, bas
   };
 }
 
+function compileGlobRegex(rawPattern) {
+  const collapsed = String(rawPattern || "")
+    .replace(/(?:\*\*\/)+/g, "**/")
+    .replace(/\/\*\*(?:\/\*\*)+/g, "/**");
+
+  let expr = "^";
+  const trailingSlash = collapsed.endsWith("/");
+  const pattern = trailingSlash ? collapsed.slice(0, -1) : collapsed;
+
+  for (let i = 0; i < pattern.length; i += 1) {
+    if (i > 0 && pattern.slice(i) === "/**") {
+      expr += "(?:/.*)?";
+      break;
+    }
+    if (pattern.startsWith("**/", i)) {
+      expr += "(?:.*/)?";
+      i += 2;
+      continue;
+    }
+    if (pattern.startsWith("**", i)) {
+      expr += ".*";
+      i += 1;
+      continue;
+    }
+    const ch = pattern[i];
+    if (ch === "*") {
+      expr += "[^/]*";
+    } else if (ch === "?") {
+      expr += "[^/]";
+    } else if (/[.+^${}()|[\]\\]/.test(ch)) {
+      expr += `\\${ch}`;
+    } else {
+      expr += ch;
+    }
+  }
+
+  if (trailingSlash) {
+    expr += "/.*";
+  }
+  expr += "$";
+  return new RegExp(expr);
+}
+
 function matchPathRule(filePath, rule) {
   const isWin = process.platform === "win32";
   const rawFile = String(filePath || "");
@@ -104,18 +147,13 @@ function matchPathRule(filePath, rule) {
   const rawRule = String(rule || "");
   const normRule = (isWin ? rawRule.replace(/\\/g, "/") : rawRule).replace(/^\.\//, "").trim();
   if (!normRule) return false;
-  if (normRule.endsWith("/**")) {
-    const prefix = normRule.slice(0, -3);
-    return normFile === prefix || normFile.startsWith(`${prefix}/`);
+  if (!normRule.includes("*") && !normRule.includes("?")) {
+    if (normRule.endsWith("/")) {
+      return normFile.startsWith(normRule);
+    }
+    return normFile === normRule || normFile.startsWith(`${normRule}/`);
   }
-  if (normRule.endsWith("/")) {
-    return normFile.startsWith(normRule);
-  }
-  if (normRule.includes("*")) {
-    const escaped = normRule.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-    return new RegExp(`^${escaped}$`).test(normFile);
-  }
-  return normFile === normRule || normFile.startsWith(`${normRule}/`);
+  return compileGlobRegex(normRule).test(normFile);
 }
 
 export function auditFileScope(changedFiles = [], { ownedFiles = [], forbiddenFiles = [] } = {}) {

@@ -1923,9 +1923,9 @@ async function testReleaseGateStateConsistencySuite() {
   {
     const r11Gate = `r11-order-${Date.now()}`;
     delete process.env.TRIRELAY_TEST_REVIEW_BLOCKING;
-    process.env.TRIRELAY_TEST_DELAY_MS = "900";
+    process.env.TRIRELAY_TEST_DELAY_MS = "1400";
     const reqA = runReviewGate(REPO_DIR, { gateKey: r11Gate, engine: "claude", maxRounds: 2 });
-    await new Promise((r) => setTimeout(r, 120));
+    await new Promise((r) => setTimeout(r, 350));
     delete process.env.TRIRELAY_TEST_DELAY_MS;
     process.env.TRIRELAY_TEST_REVIEW_BLOCKING = "1";
     let resB;
@@ -1939,6 +1939,7 @@ async function testReleaseGateStateConsistencySuite() {
     }
     assert.equal(resB.decision, "fix_required");
     assert.equal(resA.staleCompletion, true, "Older approval completing after newer blocking review must be marked stale");
+    assert.equal(resA.decision, "stale");
     assert.equal(resA.ok, false);
     const gateAfterR11 = loadReviewGateState(REPO_DIR, r11Gate);
     assert.equal(gateAfterR11.status, "open", "Older approval must NOT close cycle as passed");
@@ -2526,7 +2527,32 @@ async function testReleaseGateStateConsistencySuite() {
     assert.equal(fs.existsSync(preAbortMarker), false, "Pre-aborted spawnJsonlProcess must not spawn subprocess");
   }
 
-  console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables, R8-R25 audit hardening)");
+  // R26: auditFileScope matches anchored globs (**/.env*, **/secrets/**, packages/*/src/**, src/**/app.js, ?) at root & nested paths
+  {
+    const envAndSecretViolations = auditFileScope(
+      [".env", ".env.local", "apps/web/.env.prod", "secrets/k.json", "app/secrets/prod.json", "app/secrets/nested/k.json", "src/app.js", "foo.env", "app/mysecrets/k.json"],
+      { forbiddenFiles: ["**/.env*", "**/secrets/**"] }
+    );
+    assert.equal(envAndSecretViolations.length, 6, `Expected 6 forbidden matches, got: ${JSON.stringify(envAndSecretViolations)}`);
+
+    const pkgPaths = [
+      "packages/api/src/index.ts",
+      "packages/api/src/sub/a.js",
+      "packages/api/dist/index.ts",
+      "packages/a/b/src/index.ts",
+      ...(process.platform !== "win32" ? ["packages/api\\src/index.ts"] : [])
+    ];
+    const pkgViolations = auditFileScope(pkgPaths, { ownedFiles: ["packages/*/src/**"] });
+    const expectedPkgRejects = process.platform !== "win32" ? 3 : 2;
+    assert.equal(pkgViolations.length, expectedPkgRejects, `Unexpected packages/*/src/** audit: ${JSON.stringify(pkgViolations)}`);
+
+    const qViolations = auditFileScope(["src/.env1", "src/.en", "src/.env/a"], { forbiddenFiles: ["src/.env?"] });
+    assert.equal(qViolations.length, 1, "Single-char ? glob must match src/.env1 only");
+
+    assert.equal(auditFileScope(["src/app.js", "src/a/b/app.js"], { ownedFiles: ["src/**/app.js"] }).length, 0);
+  }
+
+  console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables, R8-R26 audit hardening)");
 }
 
 async function main() {

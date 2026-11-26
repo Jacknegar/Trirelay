@@ -1475,7 +1475,7 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
     gateKey,
     cycleId: reservation.cycleId,
     cycleNumber: reservation.cycleNumber,
-    decision,
+    decision: staleCompletion ? "stale" : decision,
     round: reservation.round,
     maxRounds,
     effort: review.effort,
