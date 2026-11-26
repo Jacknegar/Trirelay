@@ -462,7 +462,7 @@ function buildMinimalSummary(toolName, payload, originalBytes, maxBytes, { cwd =
     ...(view?.error ? { error: truncateWithByteNotice(view.error, Math.min(240, Math.floor(maxBytes / 5))) } : {}),
     _compacted: true,
     _originalBytes: originalBytes,
-    _recall: truncateWithByteNotice(recallFull, Math.min(220, Math.floor(maxBytes / 4)))
+    _recall: truncateWithByteNotice(recallFull, Math.min(1024, Math.floor(maxBytes / 3)))
   };
 
   if (Buffer.byteLength(JSON.stringify(base), "utf8") <= maxBytes) {

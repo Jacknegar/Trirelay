@@ -2228,7 +2228,160 @@ async function testReleaseGateStateConsistencySuite() {
     }
   }
 
-  console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables, R8-R19 sweep/repair/fanout/audit-hardening)");
+  // R20: Newer readonly canonical bySession entry (hadWorktree=false) must NOT shadow legacy v1.0 write entry in entries[]
+  {
+    const ledgerPath = sessionLedgerPath(REPO_DIR);
+    const ledgerR20 = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+    ledgerR20.entries["wf-r20::writer::codex"] = {
+      workflowId: "wf-r20",
+      role: "writer",
+      engine: "codex",
+      sessionId: "sess-r20-shadow",
+      sessionCwd: path.join(TMP_BASE, "deleted-legacy-wt"),
+      updatedAt: "2025-12-01T00:00:00.000Z"
+    };
+    ledgerR20.entries["wf-r20::reader::codex"] = {
+      workflowId: "wf-r20",
+      role: "reader",
+      engine: "codex",
+      sessionId: "sess-r20-shadow",
+      sessionCwd: REPO_DIR,
+      hadWorktree: false,
+      updatedAt: "2025-12-02T00:00:00.000Z"
+    };
+    ledgerR20.bySession["codex::sess-r20-shadow"] = ledgerR20.entries["wf-r20::reader::codex"];
+    writeJsonAtomic(ledgerPath, ledgerR20);
+
+    const resolvedR20 = lookupSessionById(REPO_DIR, { engine: "codex", sessionId: "sess-r20-shadow" });
+    assert.equal(resolvedR20?.hadWorktree, undefined, "lookupSessionById must prefer v1.0 unknown write entry over readonly hadWorktree=false");
+    await assert.rejects(
+      () =>
+        runSingleTask(REPO_DIR, {
+          workflowId: "wf-r20",
+          role: "writer",
+          engine: "codex",
+          mode: "write",
+          resumeRole: true,
+          prompt: "must fail closed when legacy worktree missing despite newer readonly bySession"
+        }),
+      /Cannot resume write session/i
+    );
+  }
+
+  // R21: Legacy reused worktree without baseSha diffs against worktree's own HEAD instead of moved workspace HEAD
+  {
+    const r21Repo = path.join(TMP_BASE, "r21-repo");
+    fs.mkdirSync(path.join(r21Repo, "src"), { recursive: true });
+    const gitR21 = (args) => {
+      const r = runSync("git", args, { cwd: r21Repo });
+      assert.equal(r.status, 0, `git ${args.join(" ")} failed in r21Repo: ${r.stderr}`);
+      return r;
+    };
+    gitR21(["init"]);
+    gitR21(["config", "user.email", "test@trirelay.invalid"]);
+    gitR21(["config", "user.name", "Trirelay Test"]);
+    fs.writeFileSync(path.join(r21Repo, "src", "base.js"), "export const a = 1;\n");
+    gitR21(["add", "."]);
+    gitR21(["commit", "-m", "c1"]);
+    const c1Sha = gitR21(["rev-parse", "HEAD"]).stdout.trim();
+
+    const wtR21 = createIsolatedWorktree(r21Repo, { id: `wt-r21-${Date.now()}` });
+    try {
+      // Advance main repo HEAD to C2 while legacy worktree stays checked out at C1
+      fs.writeFileSync(path.join(r21Repo, "src", "c2-only.js"), "export const c2 = 2;\n");
+      gitR21(["add", "."]);
+      gitR21(["commit", "-m", "c2"]);
+
+      fs.writeFileSync(path.join(wtR21.worktreePath, "src", "base.js"), "export const a = 99;\n");
+      const ledgerR21Path = sessionLedgerPath(r21Repo);
+      writeJsonAtomic(ledgerR21Path, {
+        entries: {
+          "wf-r21::writer::codex": {
+            workflowId: "wf-r21",
+            role: "writer",
+            engine: "codex",
+            sessionId: "sess-r21",
+            sessionCwd: wtR21.worktreePath,
+            updatedAt: "2025-12-01T00:00:00.000Z"
+          }
+        },
+        bySession: {},
+        leases: {}
+      });
+
+      const resR21 = await runSingleTask(r21Repo, {
+        workflowId: "wf-r21",
+        role: "writer",
+        engine: "codex",
+        mode: "write",
+        resumeRole: true,
+        prompt: "resume legacy worktree after main advanced"
+      });
+      assert.equal(resR21.ok, true);
+      assert.equal(resR21.baseSha, c1Sha, "Reused legacy worktree without baseSha must use its own HEAD");
+      assert.equal(resR21.changedFiles.includes("src/c2-only.js"), false, "Must NOT emit reverse diff from C2");
+    } finally {
+      removeIsolatedWorktree(r21Repo, wtR21.worktreePath);
+    }
+  }
+
+  // R22: Default 8500B MCP budget must NOT truncate _recall when workspace cwd path is long
+  {
+    const longCwd = `/tmp/${"workspace-segment-".repeat(8)}project`;
+    const bigReview = {
+      ok: false,
+      reviewId: "rev-long-cwd-test",
+      verdict: "needs-attention",
+      blockingCount: 12,
+      totalFindings: 12,
+      findings: Array.from({ length: 12 }, (_, idx) => ({
+        id: `F${idx + 1}`,
+        severity: "blocking",
+        file: `src/mod-${idx}.js`,
+        line_start: idx + 1,
+        title: `Blocker ${idx + 1}`,
+        trigger_path: `step(${idx})`,
+        body: "Narrative ".repeat(120)
+      }))
+    };
+    const compactedLongCwd = JSON.parse(serializeMcpPayload("relay_review", bigReview, { maxBytes: 8500, cwd: longCwd }).text);
+    assert.equal(compactedLongCwd._compacted, true);
+    assert.equal(compactedLongCwd._recall.includes("[TRUNCATED"), false, "_recall must not truncate at default 8500B budget");
+    assert.ok(compactedLongCwd._recall.includes(longCwd), "_recall must retain full long cwd");
+    assert.ok(compactedLongCwd._recall.includes("limit=10"), "_recall must retain full inspect arguments");
+  }
+
+  // R23: boost rejects fan-out profile triggered by phase1Prompt heuristic on empty spec BEFORE dispatching sibling 0
+  {
+    const r23ConfigDir = path.join(TMP_BASE, "r23-config");
+    fs.mkdirSync(r23ConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(r23ConfigDir, "routing.json"),
+      JSON.stringify({ profiles: { ultra: { fanout: ["claude:haiku", "codex@high"] } } })
+    );
+    const prevCfgDir = process.env.TRIRELAY_CONFIG_DIR;
+    const beforeR23Lines = fs.existsSync(RECORD_FILE) ? fs.readFileSync(RECORD_FILE, "utf8").split("\n").filter(Boolean).length : 0;
+    process.env.TRIRELAY_CONFIG_DIR = r23ConfigDir;
+    try {
+      await assert.rejects(
+        () =>
+          runOrchestration(REPO_DIR, {
+            pattern: "boost",
+            host: "agy",
+            prompt: "Analyze consistency risk",
+            models: ["claude:haiku", ""]
+          }),
+        /fan-out profile/i
+      );
+    } finally {
+      if (prevCfgDir !== undefined) process.env.TRIRELAY_CONFIG_DIR = prevCfgDir;
+      else delete process.env.TRIRELAY_CONFIG_DIR;
+    }
+    const afterR23Lines = fs.existsSync(RECORD_FILE) ? fs.readFileSync(RECORD_FILE, "utf8").split("\n").filter(Boolean).length : 0;
+    assert.equal(afterR23Lines, beforeR23Lines, "Prompt-routed fanout profile on empty spec must reject before starting sibling 0");
+  }
+
+  console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables, R8-R23 audit hardening)");
 }
 
 async function main() {

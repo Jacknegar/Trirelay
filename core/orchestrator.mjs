@@ -382,7 +382,7 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
             repoRoot: workspaceRoot,
             worktreePath: boundWorktreePath,
             branch: null,
-            baseSha: sessionEntry.baseSha || getGitHeadSha(workspaceRoot),
+            baseSha: sessionEntry.baseSha || getGitHeadSha(boundWorktreePath) || getGitHeadSha(workspaceRoot),
             reused: true
           };
           appendJobLog(logFile, `Reusing bound worktree at ${worktree.worktreePath} (base=${worktree.baseSha})`);
@@ -1707,14 +1707,19 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
     let phase1Results = [];
     let critiques = [];
     try {
+      const phase1Prompt = [
+        "Provide an independent, rigorous, first-principles analysis for the following problem.",
+        "State assumptions, key risks, concrete recommendation, and verification checks.",
+        `\nProblem:\n${question}`
+      ].join("\n");
       const resolvedPhase1 = modelSpecs.map((spec, idx) => {
-        const route = resolveRoute({ spec, host });
+        const route = resolveRoute({ spec, host, prompt: phase1Prompt, mode: "readonly" });
         if (route.fanout) {
           throw new Error(
             `Profile "${route.profile}" is a fan-out profile and cannot be assigned to an individual worker.`
           );
         }
-        return { spec, idx, route };
+        return { spec: spec || route.primary.spec, idx, route };
       });
       const phase1Promises = resolvedPhase1.map(({ spec, idx, route }) =>
         pool.run(route.primary.engine, () =>
@@ -1730,11 +1735,7 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
               timeoutMs: params.timeoutMs,
               includeHostDigest: Boolean(params.includeHostDigest || params.includeAgyDigest),
               includeRepoHandoff: Boolean(params.includeRepoHandoff),
-              prompt: [
-                "Provide an independent, rigorous, first-principles analysis for the following problem.",
-                "State assumptions, key risks, concrete recommendation, and verification checks.",
-                `\nProblem:\n${question}`
-              ].join("\n")
+              prompt: phase1Prompt
             },
             { signal: boostController.signal }
           )

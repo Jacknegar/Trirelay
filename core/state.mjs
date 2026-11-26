@@ -142,6 +142,25 @@ function entryWritePriority(entry) {
   return 0;
 }
 
+function selectCanonicalSessionEntry(ledger, engine, sessionId) {
+  const byIdKey = `${engine}::${sessionId}`;
+  const candidates = [];
+  if (ledger?.bySession?.[byIdKey]) {
+    candidates.push(ledger.bySession[byIdKey]);
+  }
+  for (const entry of Object.values(ledger?.entries ?? {})) {
+    if (entry && entry.engine === engine && entry.sessionId === sessionId) {
+      candidates.push(entry);
+    }
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => {
+    const hwDiff = entryWritePriority(b) - entryWritePriority(a);
+    return hwDiff !== 0 ? hwDiff : String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? ""));
+  });
+  return candidates[0];
+}
+
 export function recordRoleSession(
   cwd,
   {
@@ -173,16 +192,7 @@ export function recordRoleSession(
     ledger.bySession = ledger.bySession || {};
     const key = `${workflowId}::${role}::${engine}`;
     const byIdKey = `${engine}::${sessionId}`;
-    let existingById = ledger.bySession[byIdKey] || null;
-    if (!existingById) {
-      const legacyMatches = Object.values(ledger.entries)
-        .filter((e) => e && e.engine === engine && e.sessionId === sessionId)
-        .sort((a, b) => {
-          const hwDiff = entryWritePriority(b) - entryWritePriority(a);
-          return hwDiff !== 0 ? hwDiff : String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? ""));
-        });
-      existingById = legacyMatches[0] || null;
-    }
+    const existingById = selectCanonicalSessionEntry(ledger, engine, sessionId);
 
     // Never inherit worktree/patch bindings from a DIFFERENT sessionId under the same key.
     // On a non-write (readonly) run, preserve existing worktree binding (or legacy unknown status)
@@ -237,17 +247,7 @@ export function lookupRoleSession(cwd, { workflowId = "default", role, engine })
 export function lookupSessionById(cwd, { engine, sessionId }) {
   if (!engine || !sessionId) return null;
   const ledger = loadSessionLedger(cwd);
-  const indexed = ledger.bySession?.[`${engine}::${sessionId}`];
-  if (indexed) {
-    return indexed;
-  }
-  const matches = Object.values(ledger.entries ?? {})
-    .filter((entry) => entry && entry.engine === engine && entry.sessionId === sessionId)
-    .sort((a, b) => {
-      const hwDiff = entryWritePriority(b) - entryWritePriority(a);
-      return hwDiff !== 0 ? hwDiff : String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? ""));
-    });
-  return matches[0] ?? null;
+  return selectCanonicalSessionEntry(ledger, engine, sessionId);
 }
 
 export function acquireSessionLease(cwd, engine, sessionId, ownerId) {
