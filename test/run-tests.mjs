@@ -2527,13 +2527,19 @@ async function testReleaseGateStateConsistencySuite() {
     assert.equal(fs.existsSync(preAbortMarker), false, "Pre-aborted spawnJsonlProcess must not spawn subprocess");
   }
 
-  // R26: auditFileScope matches anchored globs (**/.env*, **/secrets/**, packages/*/src/**, src/**/app.js, ?) at root & nested paths
+  // R26: Segment-based zero-ReDoS glob matcher handles newlines, Unicode ?, embedded **, ReDoS patterns, & gitignore deny idioms
   {
     const envAndSecretViolations = auditFileScope(
-      [".env", ".env.local", "apps/web/.env.prod", "secrets/k.json", "app/secrets/prod.json", "app/secrets/nested/k.json", "src/app.js", "foo.env", "app/mysecrets/k.json"],
+      [".env", ".env.local", "apps/web/.env.prod", "a\nb/.env", "secrets/k.json", "app/secrets/prod.json", "app/secrets/nested/k.json", "src/app.js", "foo.env", "app/mysecrets/k.json"],
       { forbiddenFiles: ["**/.env*", "**/secrets/**"] }
     );
-    assert.equal(envAndSecretViolations.length, 6, `Expected 6 forbidden matches, got: ${JSON.stringify(envAndSecretViolations)}`);
+    assert.equal(envAndSecretViolations.length, 7, `Expected 7 forbidden matches, got: ${JSON.stringify(envAndSecretViolations)}`);
+
+    const newlineAndExampleDeny = auditFileScope(
+      ["src/secrets/x\ny", "src/secrets/a\r\nb", "chapter\nnotes/examples/doc.txt"],
+      { forbiddenFiles: ["src/secrets/**", "**/examples/**"] }
+    );
+    assert.equal(newlineAndExampleDeny.length, 3, `Newline POSIX paths must match deny rules: ${JSON.stringify(newlineAndExampleDeny)}`);
 
     const pkgPaths = [
       "packages/api/src/index.ts",
@@ -2546,10 +2552,32 @@ async function testReleaseGateStateConsistencySuite() {
     const expectedPkgRejects = process.platform !== "win32" ? 3 : 2;
     assert.equal(pkgViolations.length, expectedPkgRejects, `Unexpected packages/*/src/** audit: ${JSON.stringify(pkgViolations)}`);
 
+    // Embedded ** within a literal-prefixed segment stays inside that segment
+    assert.equal(auditFileScope(["examples-v2/manual.txt"], { ownedFiles: ["examples**/manual.txt"] }).length, 0);
+    assert.equal(auditFileScope(["examplesmanual.txt"], { ownedFiles: ["examples**/manual.txt"] }).length, 1);
+
+    // Supplementary Unicode code point with ? wildcard
+    const unicodeQ = auditFileScope(["guide/a.txt", "guide/🙂.txt", "guide/ab.txt", "guide/a/b.txt"], { forbiddenFiles: ["guide/?.txt"] });
+    assert.equal(unicodeQ.length, 2, `Expected 2 ? matches (a + 🙂), got: ${JSON.stringify(unicodeQ)}`);
     const qViolations = auditFileScope(["src/.env1", "src/.en", "src/.env/a"], { forbiddenFiles: ["src/.env?"] });
     assert.equal(qViolations.length, 1, "Single-char ? glob must match src/.env1 only");
 
+    // Gitignore-style deny idioms in forbiddenFiles vs strict segment globs in ownedFiles
+    assert.equal(auditFileScope(["prod.pem", "deploy/prod.pem"], { forbiddenFiles: ["*.pem"] }).length, 2);
+    assert.equal(auditFileScope(["prod.pem", "deploy/prod.pem"], { forbiddenFiles: ["/*.pem"] }).length, 1);
+    assert.equal(auditFileScope(["secrets/k", "secrets/prod/key"], { forbiddenFiles: ["secrets/*"] }).length, 2);
+    assert.equal(auditFileScope(["secrets", "app/secrets", "app/secrets/k.json"], { forbiddenFiles: ["**/secrets"] }).length, 3);
+    assert.equal(auditFileScope(["packages/api/dist/out.js", "packages/api/dist"], { forbiddenFiles: ["packages/*/dist/"] }).length, 1);
+    assert.equal(auditFileScope(["a", "a/b"], { forbiddenFiles: ["*"] }).length, 2);
+    assert.equal(auditFileScope(["a", "a/b"], { ownedFiles: ["*"] }).length, 1);
+
     assert.equal(auditFileScope(["src/app.js", "src/a/b/app.js"], { ownedFiles: ["src/**/app.js"] }).length, 0);
+
+    // Separated globstars do not backtrack exponentially
+    const redosStart = Date.now();
+    const redosOut = auditFileScope([`${"a/".repeat(50)}z`], { forbiddenFiles: ["**/a/**/a/**/a/**/a/**/a/**/a/**/a/**/b"] });
+    assert.equal(redosOut.length, 0);
+    assert.ok(Date.now() - redosStart < 100, "Separated globstars must evaluate linearly without ReDoS");
   }
 
   console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables, R8-R26 audit hardening)");

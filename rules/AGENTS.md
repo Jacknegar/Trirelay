@@ -12,7 +12,7 @@ Use the `trirelay` MCP tools (preferring eager core tools directly without readi
    - Large MCP outputs are deterministically compacted (`_compacted: true`) with explicit `_recall` pointers (`relay_jobs(action="result", jobId=..., compact=false)`) to prevent host disk spills.
 3. **Host-Symmetric Routing & Isolated Writes**:
    - Route by role (`advisor`, `implementer`, `reviewer`) to auto-exclude the active host, or pass explicit `spec` (`codex:gpt-6.2-astra@max`, `claude:opus@high`, `agy@high`).
-   - Require isolated git worktrees (`mode: "write"`) with disjoint `ownedFiles` and `forbiddenFiles: ["docs/handoff.md"]`; inspect `relay_apply(mode="check")` + tests before `mode="apply"`.
+   - Require isolated git worktrees (`mode: "write"`) with disjoint `ownedFiles` (strict segment globs) and `forbiddenFiles: ["docs/handoff.md"]` (gitignore-style deny globs); inspect `relay_apply(mode="check")` + tests before `mode="apply"`.
 
 ## Tool Reference (Compact Schemas)
 

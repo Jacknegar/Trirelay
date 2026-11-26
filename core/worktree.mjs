@@ -97,74 +97,142 @@ export function createIsolatedWorktree(repoRoot, { id = null, branch = null, bas
   };
 }
 
-function compileGlobRegex(rawPattern) {
-  const collapsed = String(rawPattern || "")
-    .replace(/(?:\*\*\/)+/g, "**/")
-    .replace(/\/\*\*(?:\/\*\*)+/g, "/**");
+function matchGlobSegment(fileSeg, ruleSeg) {
+  if (ruleSeg === "**") return true;
+  const fp = Array.from(fileSeg);
+  const rp = Array.from(ruleSeg);
+  let fi = 0;
+  let ri = 0;
+  let starIdx = -1;
+  let matchIdx = 0;
 
-  let expr = "^";
-  const trailingSlash = collapsed.endsWith("/");
-  const pattern = trailingSlash ? collapsed.slice(0, -1) : collapsed;
-
-  for (let i = 0; i < pattern.length; i += 1) {
-    if (i > 0 && pattern.slice(i) === "/**") {
-      expr += "(?:/.*)?";
-      break;
-    }
-    if (pattern.startsWith("**/", i)) {
-      expr += "(?:.*/)?";
-      i += 2;
-      continue;
-    }
-    if (pattern.startsWith("**", i)) {
-      expr += ".*";
-      i += 1;
-      continue;
-    }
-    const ch = pattern[i];
-    if (ch === "*") {
-      expr += "[^/]*";
-    } else if (ch === "?") {
-      expr += "[^/]";
-    } else if (/[.+^${}()|[\]\\]/.test(ch)) {
-      expr += `\\${ch}`;
+  while (fi < fp.length) {
+    if (ri < rp.length && rp[ri] === "*") {
+      while (ri < rp.length && rp[ri] === "*") {
+        ri += 1;
+      }
+      starIdx = ri - 1;
+      matchIdx = fi;
+    } else if (ri < rp.length && (rp[ri] === "?" || rp[ri] === fp[fi])) {
+      ri += 1;
+      fi += 1;
+    } else if (starIdx !== -1) {
+      ri = starIdx + 1;
+      matchIdx += 1;
+      fi = matchIdx;
     } else {
-      expr += ch;
+      return false;
     }
   }
-
-  if (trailingSlash) {
-    expr += "/.*";
+  while (ri < rp.length && rp[ri] === "*") {
+    ri += 1;
   }
-  expr += "$";
-  return new RegExp(expr);
+  return ri === rp.length;
 }
 
-function matchPathRule(filePath, rule) {
+function matchSegments(fileSegs, ruleSegs) {
+  const collapsed = [];
+  for (const seg of ruleSegs) {
+    if (seg !== "**" || collapsed[collapsed.length - 1] !== "**") {
+      collapsed.push(seg);
+    }
+  }
+  let pi = 0;
+  let ri = 0;
+  let starRi = -1;
+  let matchPi = 0;
+
+  while (pi < fileSegs.length) {
+    if (ri < collapsed.length && collapsed[ri] === "**") {
+      starRi = ri;
+      matchPi = pi;
+      ri += 1;
+    } else if (ri < collapsed.length && matchGlobSegment(fileSegs[pi], collapsed[ri])) {
+      pi += 1;
+      ri += 1;
+    } else if (starRi !== -1) {
+      ri = starRi + 1;
+      matchPi += 1;
+      pi = matchPi;
+    } else {
+      return false;
+    }
+  }
+  while (ri < collapsed.length && collapsed[ri] === "**") {
+    ri += 1;
+  }
+  return ri === collapsed.length;
+}
+
+function matchPathRule(filePath, rule, { isDeny = false } = {}) {
   const isWin = process.platform === "win32";
   const rawFile = String(filePath || "");
   const normFile = (isWin ? rawFile.replace(/\\/g, "/") : rawFile).replace(/^\.\//, "");
-  const rawRule = String(rule || "");
-  const normRule = (isWin ? rawRule.replace(/\\/g, "/") : rawRule).replace(/^\.\//, "").trim();
-  if (!normRule) return false;
-  if (!normRule.includes("*") && !normRule.includes("?")) {
-    if (normRule.endsWith("/")) {
-      return normFile.startsWith(normRule);
+  const rawRule = String(rule || "").trim();
+  const normRuleRaw = isWin ? rawRule.replace(/\\/g, "/") : rawRule;
+  const anchoredToRoot = normRuleRaw.startsWith("/");
+  const cleanRule = normRuleRaw.replace(/^\/+/, "").replace(/^\.\//, "");
+  if (!cleanRule || !normFile) return false;
+
+  const trailingSlash = cleanRule.endsWith("/");
+  const bodyRule = trailingSlash ? cleanRule.replace(/\/+$/, "") : cleanRule;
+  if (!bodyRule) return false;
+
+  const fileSegs = normFile.split("/");
+  const ruleSegs = bodyRule.split("/").filter(Boolean);
+  if (ruleSegs.length === 0) return false;
+
+  if (!isDeny) {
+    if (trailingSlash) {
+      for (let end = 1; end < fileSegs.length; end += 1) {
+        if (matchSegments(fileSegs.slice(0, end), ruleSegs)) {
+          return true;
+        }
+      }
+      return false;
     }
-    return normFile === normRule || normFile.startsWith(`${normRule}/`);
+    if (!bodyRule.includes("*") && !bodyRule.includes("?")) {
+      return normFile === bodyRule || normFile.startsWith(`${bodyRule}/`);
+    }
+    return matchSegments(fileSegs, ruleSegs);
   }
-  return compileGlobRegex(normRule).test(normFile);
+
+  // Gitignore-style deny rules: slash-free patterns without leading '/' match at any depth,
+  // and any matched ancestor directory covers all nested descendants.
+  const effectiveSegs =
+    !anchoredToRoot && ruleSegs.length === 1 && ruleSegs[0] !== "**"
+      ? ["**", ...ruleSegs]
+      : ruleSegs;
+
+  if (trailingSlash) {
+    for (let end = 1; end < fileSegs.length; end += 1) {
+      if (matchSegments(fileSegs.slice(0, end), effectiveSegs)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (matchSegments(fileSegs, effectiveSegs)) {
+    return true;
+  }
+  for (let end = 1; end < fileSegs.length; end += 1) {
+    if (matchSegments(fileSegs.slice(0, end), effectiveSegs)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function auditFileScope(changedFiles = [], { ownedFiles = [], forbiddenFiles = [] } = {}) {
   const violations = [];
   for (const file of changedFiles) {
     for (const forbidden of forbiddenFiles) {
-      if (matchPathRule(file, forbidden)) {
+      if (matchPathRule(file, forbidden, { isDeny: true })) {
         violations.push(`Modified forbidden path "${file}" (matches "${forbidden}").`);
       }
     }
-    if (ownedFiles.length > 0 && !ownedFiles.some((owned) => matchPathRule(file, owned))) {
+    if (ownedFiles.length > 0 && !ownedFiles.some((owned) => matchPathRule(file, owned, { isDeny: false }))) {
       violations.push(`Modified unowned path "${file}" (outside ownedFiles: ${ownedFiles.join(", ")}).`);
     }
   }
