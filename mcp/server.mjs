@@ -13,7 +13,12 @@ import {
   resolveWorkspaceRoot
 } from "../core/env.mjs";
 import { createHandoffPacket, listWorkspaceClaudeSessions, loadHandoffPacket } from "../core/handoff.mjs";
-import { cancelAllActiveInProcessJobs, handleJobControl, launchBackgroundJob } from "../core/jobs.mjs";
+import {
+  cancelAllActiveInProcessJobs,
+  handleJobControl,
+  launchBackgroundJob,
+  registerActiveAbortController
+} from "../core/jobs.mjs";
 import {
   assertRecursionSafe,
   inspectReviewArtifact,
@@ -159,7 +164,8 @@ const TOOLS = [
         codexModel: { type: "string" },
         claudeModel: { type: "string" },
         effort: { type: "string" },
-        native: { type: "boolean" }
+        native: { type: "boolean" },
+        timeoutMs: { type: "number" }
       }
     }
   },
@@ -187,7 +193,8 @@ const TOOLS = [
         scope: { type: "string", enum: ["auto", "working-tree", "branch"] },
         base: { type: "string" },
         focus: { type: "string" },
-        effort: { type: "string" }
+        effort: { type: "string" },
+        timeoutMs: { type: "number" }
       }
     }
   },
@@ -472,7 +479,10 @@ async function handleToolCall(name, args = {}) {
             runSingleTask(cwd, args, { jobId, logFile, signal })
         );
       }
-      const res = await runSingleTask(cwd, args);
+      const controller = new AbortController();
+      const promise = runSingleTask(cwd, args, { signal: controller.signal });
+      registerActiveAbortController(controller, promise);
+      const res = await promise;
       return { isToolError: !res.ok, data: res };
     }
 
@@ -489,7 +499,10 @@ async function handleToolCall(name, args = {}) {
           ({ signal }) => runDualReview(cwd, args, { signal })
         );
       }
-      const res = await runDualReview(cwd, args);
+      const controller = new AbortController();
+      const promise = runDualReview(cwd, args, { signal: controller.signal });
+      registerActiveAbortController(controller, promise);
+      const res = await promise;
       return { isToolError: !res.ok, data: res };
     }
 
@@ -506,7 +519,10 @@ async function handleToolCall(name, args = {}) {
           ({ signal }) => runReviewGate(cwd, args, { signal })
         );
       }
-      return await runReviewGate(cwd, args);
+      const controller = new AbortController();
+      const promise = runReviewGate(cwd, args, { signal: controller.signal });
+      registerActiveAbortController(controller, promise);
+      return await promise;
     }
 
     case "relay_design": {
@@ -516,14 +532,21 @@ async function handleToolCall(name, args = {}) {
         return launchBackgroundJob(
           cwd,
           { kind: "design", workflowId: args.designId || "design", role: "advisor", mode: "readonly" },
-          () => runDualDesign(cwd, args)
+          ({ signal }) => runDualDesign(cwd, args, { signal })
         );
       }
-      return await runDualDesign(cwd, args);
+      const controller = new AbortController();
+      const promise = runDualDesign(cwd, args, { signal: controller.signal });
+      registerActiveAbortController(controller, promise);
+      return await promise;
     }
 
-    case "relay_copy_review":
-      return await runCopyReview(cwd, args);
+    case "relay_copy_review": {
+      const controller = new AbortController();
+      const promise = runCopyReview(cwd, args, { signal: controller.signal });
+      registerActiveAbortController(controller, promise);
+      return await promise;
+    }
 
     case "relay_orchestrate": {
       assertRecursionSafe(cwd);
@@ -535,12 +558,15 @@ async function handleToolCall(name, args = {}) {
           ({ signal }) => runOrchestration(cwd, args, { signal })
         );
       }
-      const res = await runOrchestration(cwd, args);
+      const controller = new AbortController();
+      const promise = runOrchestration(cwd, args, { signal: controller.signal });
+      registerActiveAbortController(controller, promise);
+      const res = await promise;
       return { isToolError: !res.ok, data: res };
     }
 
     case "relay_apply": {
-      const detail = await handleJobControl(cwd, { action: "result", jobId: args.jobId });
+      const detail = await handleJobControl(cwd, { action: "result", jobId: args.jobId, exact: true });
       return applyJobPatch(cwd, detail.job, { mode: args.mode || "check" });
     }
 
@@ -691,20 +717,24 @@ async function handleRequest(msg) {
 
 export function startMcpServer() {
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-  let shuttingDown = false;
-  const shutdown = () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    void cancelAllActiveInProcessJobs(1500);
+  let shutdownPromise = null;
+  const shutdown = async (exitOnFinish = false) => {
+    if (!shutdownPromise) {
+      shutdownPromise = cancelAllActiveInProcessJobs(2500).catch(() => {});
+    }
+    await shutdownPromise;
+    if (exitOnFinish) {
+      process.exit(0);
+    }
   };
-  rl.on("close", shutdown);
+  rl.on("close", () => {
+    void shutdown(false);
+  });
   process.on("SIGTERM", () => {
-    shutdown();
-    setTimeout(() => process.exit(0), 250).unref?.();
+    void shutdown(true);
   });
   process.on("SIGINT", () => {
-    shutdown();
-    setTimeout(() => process.exit(0), 250).unref?.();
+    void shutdown(true);
   });
   rl.on("line", (line) => {
     const trimmed = line.trim();

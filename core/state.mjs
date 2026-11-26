@@ -152,6 +152,7 @@ export function recordRoleSession(
     patchSha256 = null,
     deliverableMode = null,
     finalHeadSha = null,
+    captureComplete = true,
     isWriteRun = false
   }
 ) {
@@ -165,7 +166,16 @@ export function recordRoleSession(
     ledger.bySession = ledger.bySession || {};
     const key = `${workflowId}::${role}::${engine}`;
     const byIdKey = `${engine}::${sessionId}`;
-    const existingById = ledger.bySession[byIdKey] || null;
+    let existingById = ledger.bySession[byIdKey] || null;
+    if (!existingById) {
+      const legacyMatches = Object.values(ledger.entries)
+        .filter((e) => e && e.engine === engine && e.sessionId === sessionId)
+        .sort((a, b) => {
+          const hwDiff = (b.hadWorktree ? 1 : 0) - (a.hadWorktree ? 1 : 0);
+          return hwDiff !== 0 ? hwDiff : String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? ""));
+        });
+      existingById = legacyMatches[0] || null;
+    }
 
     // Never inherit worktree/patch bindings from a DIFFERENT sessionId under the same key.
     // On a non-write (readonly) run, preserve existing worktree binding only if it belongs
@@ -186,6 +196,7 @@ export function recordRoleSession(
       patchSha256: isWriteRun ? patchSha256 ?? null : preserveExistingWrite ? existingById.patchSha256 ?? null : null,
       deliverableMode: isWriteRun ? deliverableMode ?? null : preserveExistingWrite ? existingById.deliverableMode ?? null : null,
       finalHeadSha: isWriteRun ? finalHeadSha ?? null : preserveExistingWrite ? existingById.finalHeadSha ?? null : null,
+      captureComplete: isWriteRun ? Boolean(captureComplete) : preserveExistingWrite ? existingById.captureComplete !== false : true,
       hadWorktree: Boolean(isWriteRun || preserveExistingWrite),
       updatedAt: nowIso()
     };
@@ -405,11 +416,17 @@ export function upsertJob(cwd, patch) {
   });
 }
 
-export function readJobDetail(cwd, jobId) {
+export function readJobDetail(cwd, jobId, { exact = false } = {}) {
   const safeId = validateOpaqueId(jobId, "jobId");
   const jobs = listJobs(cwd);
-  const match = jobs.find((j) => j.id === safeId) ?? jobs.find((j) => j.id.startsWith(safeId));
+  const match = exact
+    ? jobs.find((j) => j.id === safeId)
+    : (jobs.find((j) => j.id === safeId) ?? jobs.find((j) => j.id.startsWith(safeId)));
   const targetId = match ? match.id : safeId;
+  if (exact && !match) {
+    const exactFile = resolveJobFile(cwd, safeId);
+    if (!fs.existsSync(exactFile)) return null;
+  }
   const detailFile = resolveJobFile(cwd, targetId);
   const detail = readJsonSafe(detailFile, null);
   if (!match && !detail) {
@@ -472,7 +489,71 @@ function applyPinTransition(pins, record) {
   return next;
 }
 
+function computeFileEdgeHashes(filePath, size) {
+  if (!size || size <= 0) {
+    return { headHash: null, tailHash: null };
+  }
+  const edgeBytes = Math.min(512, size);
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const headBuf = Buffer.alloc(edgeBytes);
+    const hRead = fs.readSync(fd, headBuf, 0, edgeBytes, 0);
+    const headHash = createHash("sha256").update(headBuf.subarray(0, hRead)).digest("hex").slice(0, 16);
+    const tailOffset = Math.max(0, size - edgeBytes);
+    const tailBuf = Buffer.alloc(edgeBytes);
+    const tRead = fs.readSync(fd, tailBuf, 0, edgeBytes, tailOffset);
+    const tailHash = createHash("sha256").update(tailBuf.subarray(0, tRead)).digest("hex").slice(0, 16);
+    return { headHash, tailHash };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function repairBoardTailLocked(boardFile) {
+  if (!fs.existsSync(boardFile)) return;
+  const st = fs.statSync(boardFile);
+  if (st.size === 0) return;
+
+  const fd = fs.openSync(boardFile, "r");
+  try {
+    const lastByte = Buffer.alloc(1);
+    fs.readSync(fd, lastByte, 0, 1, st.size - 1);
+    if (lastByte[0] === 0x0a) {
+      return;
+    }
+    // Unterminated tail: read trailing window, keep complete JSON if valid else truncate torn fragment.
+    const scanLen = Math.min(st.size, 65536);
+    const scanOffset = st.size - scanLen;
+    const tailBuf = Buffer.alloc(scanLen);
+    const n = fs.readSync(fd, tailBuf, 0, scanLen, scanOffset);
+    const slice = tailBuf.subarray(0, n);
+    const lastNl = slice.lastIndexOf(0x0a);
+    const fragOffset = lastNl === -1 ? scanOffset : scanOffset + lastNl + 1;
+    const fragText = slice.subarray(lastNl + 1).toString("utf8").trim();
+    if (fragText) {
+      try {
+        JSON.parse(fragText);
+        fs.closeSync(fd);
+        fs.appendFileSync(boardFile, "\n", "utf8");
+        return;
+      } catch {
+        // Fall through and truncate incomplete JSON line.
+      }
+    }
+    fs.closeSync(fd);
+    fs.truncateSync(boardFile, fragOffset);
+    return;
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // Already closed on repair path.
+    }
+  }
+}
+
 function rebuildPinsFromBoardLocked(boardFile, pinsFile, boardId) {
+  repairBoardTailLocked(boardFile);
   const st = fs.statSync(boardFile);
   const lines = fs.readFileSync(boardFile, "utf8").split(/\r?\n/).filter(Boolean);
   let pins = [];
@@ -488,7 +569,16 @@ function rebuildPinsFromBoardLocked(boardFile, pinsFile, boardId) {
       // Skip malformed line.
     }
   }
-  writeJsonAtomic(pinsFile, { boardId, indexedSeq: lastSeq, logSize: st.size, updatedAt: nowIso(), pins });
+  const { headHash, tailHash } = computeFileEdgeHashes(boardFile, st.size);
+  writeJsonAtomic(pinsFile, {
+    boardId,
+    indexedSeq: lastSeq,
+    logSize: st.size,
+    headHash,
+    tailHash,
+    updatedAt: nowIso(),
+    pins
+  });
   return pins;
 }
 
@@ -499,10 +589,18 @@ export function readActiveBoardPins(cwd, boardId = "default") {
   }
   const pinsFile = resolveBoardPinsFile(cwd, boardId);
   const st = fs.statSync(boardFile);
+  const { headHash, tailHash } = computeFileEdgeHashes(boardFile, st.size);
   const data = fs.existsSync(pinsFile) ? readJsonSafe(pinsFile, null) : null;
 
-  if (data && Array.isArray(data.pins) && typeof data.logSize === "number") {
-    if (data.logSize === st.size) {
+  const hasValidIdentity =
+    data &&
+    Array.isArray(data.pins) &&
+    typeof data.logSize === "number" &&
+    data.headHash &&
+    data.headHash === headHash;
+
+  if (hasValidIdentity) {
+    if (data.logSize === st.size && data.tailHash === tailHash) {
       return data.pins.filter((p) => p.status === "active");
     }
     if (data.logSize >= 0 && data.logSize < st.size) {
@@ -516,32 +614,34 @@ export function readActiveBoardPins(cwd, boardId = "default") {
       } finally {
         fs.closeSync(fd);
       }
-      let pins = data.pins.map((p) => ({ ...p }));
-      let parseOk = true;
-      let sawPinChange = false;
-      for (const line of tailText.split(/\r?\n/).filter(Boolean)) {
-        try {
-          const rec = JSON.parse(line);
-          if (isPinTag(rec.tag) || isRetireTag(rec.tag) || rec.supersedes !== undefined) {
-            sawPinChange = true;
+      if (tailText.endsWith("\n")) {
+        let pins = data.pins.map((p) => ({ ...p }));
+        let parseOk = true;
+        let sawPinChange = false;
+        for (const line of tailText.split(/\r?\n/).filter(Boolean)) {
+          try {
+            const rec = JSON.parse(line);
+            if (isPinTag(rec.tag) || isRetireTag(rec.tag) || rec.supersedes !== undefined) {
+              sawPinChange = true;
+            }
+            pins = applyPinTransition(pins, rec);
+          } catch {
+            parseOk = false;
+            break;
           }
-          pins = applyPinTransition(pins, rec);
-        } catch {
-          parseOk = false;
-          break;
         }
-      }
-      if (parseOk) {
-        if (sawPinChange || deltaSize > 8192) {
-          const reconciled = withFileLockSync(boardFile, () => rebuildPinsFromBoardLocked(boardFile, pinsFile, boardId));
-          return reconciled.filter((p) => p.status === "active");
+        if (parseOk) {
+          if (sawPinChange || deltaSize > 8192) {
+            const reconciled = withFileLockSync(boardFile, () => rebuildPinsFromBoardLocked(boardFile, pinsFile, boardId));
+            return reconciled.filter((p) => p.status === "active");
+          }
+          return pins.filter((p) => p.status === "active");
         }
-        return pins.filter((p) => p.status === "active");
       }
     }
   }
 
-  // Missing, corrupt, or out-of-sync index: rebuild strictly under the board lock.
+  // Missing, corrupt, torn-tail, or replaced log: rebuild strictly under the board lock.
   const pins = withFileLockSync(boardFile, () => rebuildPinsFromBoardLocked(boardFile, pinsFile, boardId));
   return pins.filter((p) => p.status === "active");
 }
@@ -600,6 +700,7 @@ export function postBoardMessage(cwd, boardId = "default", entry = {}) {
   const file = resolveBoardFile(cwd, safeBoardId);
   const pinsFile = resolveBoardPinsFile(cwd, safeBoardId);
   return withFileLockSync(file, () => {
+    repairBoardTailLocked(file);
     let tail = readBoardPosts(cwd, safeBoardId, { since: 0, limit: 1 });
     if (tail.length === 0 && fs.existsSync(file) && fs.statSync(file).size > 0) {
       tail = readBoardPosts(cwd, safeBoardId, { since: 0, limit: 0 });
@@ -627,25 +728,35 @@ export function postBoardMessage(cwd, boardId = "default", entry = {}) {
       ...(entry.model ? { model: entry.model } : {})
     };
     const oldSize = fs.existsSync(file) ? fs.statSync(file).size : 0;
+    const prevHeadHash = oldSize > 0 ? computeFileEdgeHashes(file, oldSize).headHash : null;
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     fs.appendFileSync(file, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
     const newSize = fs.statSync(file).size;
+    const { headHash, tailHash } = computeFileEdgeHashes(file, newSize);
 
-    // Keep dedicated active pins index watermark-aligned atomically under the board lock.
-    if (isPinTag(record.tag) || isRetireTag(record.tag) || record.supersedes !== undefined) {
-      const existingIndex = fs.existsSync(pinsFile) ? readJsonSafe(pinsFile, null) : null;
-      if (existingIndex && Array.isArray(existingIndex.pins) && existingIndex.logSize === oldSize) {
-        const updatedPins = applyPinTransition(existingIndex.pins, record);
-        writeJsonAtomic(pinsFile, {
-          boardId: safeBoardId,
-          indexedSeq: record.seq,
-          logSize: newSize,
-          updatedAt: nowIso(),
-          pins: updatedPins
-        });
-      } else {
-        rebuildPinsFromBoardLocked(file, pinsFile, safeBoardId);
-      }
+    // Keep dedicated active pins index watermark-aligned atomically under the board lock,
+    // advancing the watermark on ordinary updates too so later pin posts don't force a full replay.
+    const existingIndex = fs.existsSync(pinsFile) ? readJsonSafe(pinsFile, null) : null;
+    const needsPinUpdate = isPinTag(record.tag) || isRetireTag(record.tag) || record.supersedes !== undefined;
+    const indexAligned =
+      existingIndex &&
+      Array.isArray(existingIndex.pins) &&
+      existingIndex.logSize === oldSize &&
+      (!prevHeadHash || existingIndex.headHash === prevHeadHash);
+
+    if (indexAligned) {
+      const updatedPins = needsPinUpdate ? applyPinTransition(existingIndex.pins, record) : existingIndex.pins;
+      writeJsonAtomic(pinsFile, {
+        boardId: safeBoardId,
+        indexedSeq: record.seq,
+        logSize: newSize,
+        headHash,
+        tailHash,
+        updatedAt: nowIso(),
+        pins: updatedPins
+      });
+    } else if (needsPinUpdate || !existingIndex) {
+      rebuildPinsFromBoardLocked(file, pinsFile, safeBoardId);
     }
     return record;
   });
@@ -725,6 +836,9 @@ export function resolveReviewArtifactFile(cwd, reviewId) {
 export function saveReviewArtifact(cwd, reviewId, payload) {
   const file = resolveReviewArtifactFile(cwd, reviewId);
   return withFileLockSync(file, () => {
+    if (fs.existsSync(file)) {
+      throw new Error(`Review artifact "${reviewId}" already exists (write-once).`);
+    }
     writeJsonAtomic(file, { ...payload, reviewId, updatedAt: nowIso() });
     return file;
   });

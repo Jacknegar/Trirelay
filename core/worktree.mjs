@@ -145,11 +145,14 @@ export function captureWorktreeChanges(repoRoot, worktreePath, worktreeId, baseS
   if (statusRes.status !== 0 || statusRes.error) {
     return {
       hasChanges: true,
+      deliverableMode: "incomplete",
+      ignoredOnlyDeliverables: false,
       captureComplete: false,
       error: `git status failed in worktree: ${statusRes.stderr || statusRes.error?.message || statusRes.status}`,
       changedFiles: [],
       ignoredFiles: [],
       ignoredFilesTotal: 0,
+      allIgnoredFiles: [],
       patchPath: null,
       patchSha256: null,
       diffStat: "",
@@ -164,11 +167,14 @@ export function captureWorktreeChanges(repoRoot, worktreePath, worktreeId, baseS
   if (ignoredRes.status !== 0 || ignoredRes.error) {
     return {
       hasChanges: true,
+      deliverableMode: "incomplete",
+      ignoredOnlyDeliverables: false,
       captureComplete: false,
       error: `git ls-files --ignored failed in worktree: ${ignoredRes.stderr || ignoredRes.error?.message || ignoredRes.status}`,
       changedFiles: parsePorcelainZ(String(statusRes.stdout)),
       ignoredFiles: [],
       ignoredFilesTotal: 0,
+      allIgnoredFiles: [],
       patchPath: null,
       patchSha256: null,
       diffStat: "",
@@ -189,11 +195,14 @@ export function captureWorktreeChanges(repoRoot, worktreePath, worktreeId, baseS
     if (committedRes.status !== 0 || committedRes.error) {
       return {
         hasChanges: true,
+        deliverableMode: "incomplete",
+        ignoredOnlyDeliverables: false,
         captureComplete: false,
         error: `git diff --name-only failed in worktree: ${committedRes.stderr || committedRes.error?.message}`,
         changedFiles: workingChanged,
         ignoredFiles,
         ignoredFilesTotal,
+        allIgnoredFiles,
         patchPath: null,
         patchSha256: null,
         diffStat: "",
@@ -214,6 +223,7 @@ export function captureWorktreeChanges(repoRoot, worktreePath, worktreeId, baseS
       changedFiles: [],
       ignoredFiles,
       ignoredFilesTotal,
+      allIgnoredFiles,
       patchPath: null,
       patchSha256: null,
       diffStat: "",
@@ -226,11 +236,14 @@ export function captureWorktreeChanges(repoRoot, worktreePath, worktreeId, baseS
     if (addRes.status !== 0 || addRes.error) {
       return {
         hasChanges: true,
+        deliverableMode: "incomplete",
+        ignoredOnlyDeliverables: false,
         captureComplete: false,
         error: `git add -N failed in worktree: ${addRes.stderr || addRes.error?.message}`,
         changedFiles,
         ignoredFiles,
         ignoredFilesTotal,
+        allIgnoredFiles,
         patchPath: null,
         patchSha256: null,
         diffStat: "",
@@ -254,11 +267,14 @@ export function captureWorktreeChanges(repoRoot, worktreePath, worktreeId, baseS
   if (diffRes.status !== 0 || diffRes.error) {
     return {
       hasChanges: true,
+      deliverableMode: "incomplete",
+      ignoredOnlyDeliverables: false,
       captureComplete: false,
       error: `git diff failed in worktree: ${String(diffRes.stderr) || diffRes.error?.message}`,
       changedFiles,
       ignoredFiles,
       ignoredFilesTotal,
+      allIgnoredFiles,
       patchPath: null,
       patchSha256: null,
       diffStat: String(statRes.stdout || "").trim(),
@@ -292,6 +308,7 @@ export function captureWorktreeChanges(repoRoot, worktreePath, worktreeId, baseS
     changedFiles,
     ignoredFiles,
     ignoredFilesTotal,
+    allIgnoredFiles,
     patchPath,
     patchSha256,
     diffStat: String(statRes.stdout || "").trim(),
@@ -299,81 +316,56 @@ export function captureWorktreeChanges(repoRoot, worktreePath, worktreeId, baseS
   };
 }
 
-function unquoteGitPath(raw) {
-  const s = String(raw || "").trim();
-  if (!s) return "";
-  if (s.startsWith('"') && s.endsWith('"')) {
-    try {
-      return JSON.parse(s);
-    } catch {
-      return s.slice(1, -1);
-    }
+export function extractPatchTouchedFiles(patchInput, repoRoot = process.cwd()) {
+  const patchBuf = Buffer.isBuffer(patchInput) ? patchInput : Buffer.from(String(patchInput || ""), "utf8");
+  if (patchBuf.length === 0) {
+    return [];
   }
-  return s;
-}
-
-export function extractPatchTouchedFiles(patchText) {
+  const res = runSync("git", ["apply", "--numstat", "-z", "-"], {
+    cwd: repoRoot,
+    input: patchBuf,
+    timeoutMs: 15000
+  });
+  if (res.status !== 0 || res.error) {
+    throw new Error(
+      `Patch failed git --numstat validation: ${String(res.stderr || res.error?.message || res.status).trim()}`
+    );
+  }
+  const parts = String(res.stdout || "").split("\0");
   const touched = new Set();
-  const lines = String(patchText || "").split(/\r?\n/);
-  for (const line of lines) {
-    if (line.startsWith("diff --git ")) {
-      const rest = line.slice("diff --git ".length);
-      if (rest.startsWith('"')) {
-        const m = rest.match(/^"a\/((?:[^"\\]|\\.)*)"\s+"b\/((?:[^"\\]|\\.)*)"$/);
-        if (m) {
-          touched.add(unquoteGitPath(`"${m[1]}"`));
-          touched.add(unquoteGitPath(`"${m[2]}"`));
-          continue;
-        }
-      }
-      if (rest.startsWith("a/")) {
-        // Split at an interior ` b/` boundary where both sides match, or fall back to space split.
-        let matched = false;
-        let searchFrom = 2;
-        while (searchFrom < rest.length) {
-          const idx = rest.indexOf(" b/", searchFrom);
-          if (idx === -1) break;
-          const left = rest.slice(2, idx);
-          const right = rest.slice(idx + 3);
-          if (left === right) {
-            touched.add(left);
-            matched = true;
-            break;
-          }
-          searchFrom = idx + 1;
-        }
-        if (!matched) {
-          const sp = rest.indexOf(" b/");
-          if (sp > 2) {
-            touched.add(rest.slice(2, sp));
-            touched.add(rest.slice(sp + 3));
-          }
-        }
-      }
-    } else if (line.startsWith("--- ") || line.startsWith("+++ ")) {
-      const val = unquoteGitPath(line.slice(4));
-      if (val !== "/dev/null") {
-        touched.add(val.replace(/^[ab]\//, ""));
-      }
-    } else if (line.startsWith("rename from ") || line.startsWith("copy from ")) {
-      const p = unquoteGitPath(line.slice(line.indexOf("from ") + 5));
-      if (p) touched.add(p);
-    } else if (line.startsWith("rename to ") || line.startsWith("copy to ")) {
-      const p = unquoteGitPath(line.slice(line.indexOf("to ") + 3));
-      if (p) touched.add(p);
+  for (let i = 0; i < parts.length; i += 1) {
+    const entry = parts[i];
+    if (!entry) continue;
+    const tab1 = entry.indexOf("\t");
+    const tab2 = tab1 !== -1 ? entry.indexOf("\t", tab1 + 1) : -1;
+    if (tab2 === -1) continue;
+    const rest = entry.slice(tab2 + 1);
+    if (rest === "" && i + 2 < parts.length) {
+      if (parts[i + 1]) touched.add(parts[i + 1]);
+      if (parts[i + 2]) touched.add(parts[i + 2]);
+      i += 2;
+    } else if (rest) {
+      touched.add(rest);
     }
   }
   return [...touched].filter(Boolean);
 }
 
-export function applyPatchToWorktree(worktreePath, patchPath) {
+export function applyPatchToWorktree(worktreePath, patchPath, { expectedSha256 = null } = {}) {
   if (!worktreePath || !fs.existsSync(worktreePath)) {
     throw new Error(`Target worktree does not exist: ${worktreePath}`);
   }
   if (!patchPath || !fs.existsSync(patchPath)) {
     throw new Error(`Replay patch file not found: ${patchPath}`);
   }
-  const res = runSync("git", ["apply", "--binary", patchPath], { cwd: worktreePath, timeoutMs: 15000 });
+  const patchBuf = fs.readFileSync(patchPath);
+  if (expectedSha256) {
+    const actualSha = crypto.createHash("sha256").update(patchBuf).digest("hex");
+    if (actualSha !== expectedSha256) {
+      throw new Error(`Replay patch integrity check failed for ${patchPath}: expected ${expectedSha256}, got ${actualSha}.`);
+    }
+  }
+  const res = runSync("git", ["apply", "--binary", "-"], { cwd: worktreePath, input: patchBuf, timeoutMs: 15000 });
   if (res.status !== 0) {
     throw new Error(`Failed to replay prior patch into worktree: ${String(res.stderr).trim() || String(res.stdout).trim()}`);
   }
@@ -394,20 +386,21 @@ export function removeIsolatedWorktree(repoRoot, worktreePath) {
   return { removed: true };
 }
 
-export function applyWorktreePatch(repoRoot, patchPath, { mode = "check" } = {}) {
+export function applyWorktreePatch(repoRoot, patchPath, { mode = "check", patchBuf = null } = {}) {
   if (!isGitRepo(repoRoot)) {
     throw new Error(`Target workspace is not a git repository: ${repoRoot}`);
   }
   const patchesDir = ensureSubdir(repoRoot, "patches");
   const resolvedPatch = assertPathInside(patchesDir, canonicalizePath(patchPath), "patchPath");
-  if (!fs.existsSync(resolvedPatch)) {
+  if (!patchBuf && !fs.existsSync(resolvedPatch)) {
     throw new Error(`Patch file not found: ${resolvedPatch}`);
   }
+  const buf = Buffer.isBuffer(patchBuf) ? patchBuf : fs.readFileSync(resolvedPatch);
 
-  const args = mode === "apply" ? ["apply", "--index", resolvedPatch] : ["apply", "--check", resolvedPatch];
-  let res = runSync("git", args, { cwd: repoRoot, timeoutMs: 15000 });
+  const args = mode === "apply" ? ["apply", "--index", "-"] : ["apply", "--check", "-"];
+  let res = runSync("git", args, { cwd: repoRoot, input: buf, timeoutMs: 15000 });
   if (res.status !== 0 && mode === "apply") {
-    res = runSync("git", ["apply", resolvedPatch], { cwd: repoRoot, timeoutMs: 15000 });
+    res = runSync("git", ["apply", "-"], { cwd: repoRoot, input: buf, timeoutMs: 15000 });
   }
   if (res.status !== 0) {
     throw new Error(`git apply (${mode}) failed: ${String(res.stderr).trim() || String(res.stdout).trim()}`);
@@ -431,6 +424,9 @@ export function applyJobPatch(repoRoot, job, { mode = "check" } = {}) {
   if (!patchPath) {
     throw new Error(`Job "${job.id}" has no captured patchPath.`);
   }
+  if (mode === "apply" && !job.patchSha256) {
+    throw new Error(`Refusing to apply legacy or unauthenticated patch for job "${job.id}" without patchSha256.`);
+  }
   const patchesDir = ensureSubdir(repoRoot, "patches");
   const resolvedPatch = assertPathInside(patchesDir, canonicalizePath(patchPath), "patchPath");
   if (!fs.existsSync(resolvedPatch)) {
@@ -447,7 +443,7 @@ export function applyJobPatch(repoRoot, job, { mode = "check" } = {}) {
     }
   }
 
-  const touchedFiles = extractPatchTouchedFiles(patchBuf.toString("utf8"));
+  const touchedFiles = extractPatchTouchedFiles(patchBuf, repoRoot);
   if (touchedFiles.length > 0) {
     const reAuditViolations = auditFileScope(touchedFiles, {
       ownedFiles: Array.isArray(job.ownedFiles) ? job.ownedFiles : [],
@@ -458,5 +454,5 @@ export function applyJobPatch(repoRoot, job, { mode = "check" } = {}) {
     }
   }
 
-  return applyWorktreePatch(repoRoot, resolvedPatch, { mode });
+  return applyWorktreePatch(repoRoot, resolvedPatch, { mode, patchBuf });
 }

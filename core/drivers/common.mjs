@@ -84,6 +84,7 @@ export function spawnJsonlProcess({
     let timedOut = false;
     let aborted = false;
     let terminating = false;
+    let sweepingGroup = false;
     let settled = false;
     let forceKillTimer = null;
     let exitDrainTimer = null;
@@ -146,6 +147,7 @@ export function spawnJsonlProcess({
 
     function terminateTree({ markTerminating = true } = {}) {
       if ((terminating && markTerminating) || settled) return;
+      sweepingGroup = true;
       if (markTerminating) {
         terminating = true;
       }
@@ -265,7 +267,7 @@ export function spawnJsonlProcess({
     proc.on("close", (code) => {
       // Do NOT cancel SIGKILL escalation simply because pipes closed after the leader exited
       // if grandchildren in the detached process group are still alive.
-      if (terminating && useProcessGroup && proc.pid && forceKillTimer && isProcessGroupAlive(proc.pid)) {
+      if ((terminating || sweepingGroup) && useProcessGroup && proc.pid && forceKillTimer && isProcessGroupAlive(proc.pid)) {
         return;
       }
       finalize(code ?? exitCode);

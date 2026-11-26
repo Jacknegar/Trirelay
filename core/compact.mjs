@@ -283,20 +283,47 @@ function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function buildRecallPointer(toolName, payload) {
-  if (payload?.reviewId) {
-    return `relay_review(action="inspect", reviewId="${payload.reviewId}", offset=0, limit=10)`;
+function unwrapJobPayload(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  if (payload.job && typeof payload.job === "object") {
+    const jobResult = payload.job.result && typeof payload.job.result === "object" ? payload.job.result : {};
+    return {
+      ...jobResult,
+      ...payload.job,
+      ...payload,
+      reviewId: payload.reviewId || payload.job.reviewId || jobResult.reviewId || null,
+      decision: payload.decision || payload.job.decision || jobResult.decision || null,
+      verdict: payload.verdict || payload.job.verdict || jobResult.verdict || null,
+      totalFindings: payload.totalFindings ?? payload.job.totalFindings ?? jobResult.totalFindings ?? null,
+      blockingCount: payload.blockingCount ?? payload.job.blockingCount ?? jobResult.blockingCount ?? null,
+      advisoryCount: payload.advisoryCount ?? payload.job.advisoryCount ?? jobResult.advisoryCount ?? null,
+      blockingFindings: payload.blockingFindings ?? jobResult.blockingFindings,
+      remainingBlockingFindings: payload.remainingBlockingFindings ?? jobResult.remainingBlockingFindings,
+      findings: payload.findings ?? jobResult.findings,
+      deliverableMode: payload.deliverableMode || payload.job.deliverableMode || jobResult.deliverableMode || null,
+      ignoredOnlyDeliverables: payload.ignoredOnlyDeliverables ?? payload.job.ignoredOnlyDeliverables ?? jobResult.ignoredOnlyDeliverables,
+      ignoredFiles: payload.ignoredFiles ?? payload.job.ignoredFiles ?? jobResult.ignoredFiles,
+      worktreePath: payload.worktreePath || payload.job.worktreePath || jobResult.worktreePath || null
+    };
   }
-  const jobId = payload?.jobId || payload?.job?.id;
+  return payload;
+}
+
+function buildRecallPointer(toolName, payload) {
+  const view = unwrapJobPayload(payload);
+  if (view?.reviewId) {
+    return `relay_review(action="inspect", reviewId="${view.reviewId}", offset=0, limit=10)`;
+  }
+  const jobId = view?.jobId || view?.job?.id || view?.id;
   if (jobId) {
     return `relay_jobs(action="result", jobId="${jobId}", compact=false)`;
   }
-  if (payload?.handoffId || payload?.packet?.handoffId) {
-    const hid = payload?.handoffId || payload?.packet?.handoffId;
+  if (view?.handoffId || view?.packet?.handoffId) {
+    const hid = view?.handoffId || view?.packet?.handoffId;
     return `relay_handoff(action="inspect", handoffId="${hid}")`;
   }
-  if (payload?.boardId) {
-    return `relay_board(action="read", boardId="${payload.boardId}", view="full")`;
+  if (view?.boardId) {
+    return `relay_board(action="read", boardId="${view.boardId}", view="full")`;
   }
   return toolName ? `Inspect local job/artifact records for ${toolName} directly.` : "Inspect artifact paths directly.";
 }
@@ -340,12 +367,13 @@ function isBlockingLike(finding) {
 }
 
 function buildBlockingPreview(payload, maxItems = 6) {
-  const source = Array.isArray(payload?.blockingFindings) && payload.blockingFindings.length
-    ? payload.blockingFindings
-    : Array.isArray(payload?.remainingBlockingFindings) && payload.remainingBlockingFindings.length
-      ? payload.remainingBlockingFindings
-      : Array.isArray(payload?.findings)
-        ? payload.findings.filter(isBlockingLike)
+  const view = unwrapJobPayload(payload);
+  const source = Array.isArray(view?.blockingFindings) && view.blockingFindings.length
+    ? view.blockingFindings
+    : Array.isArray(view?.remainingBlockingFindings) && view.remainingBlockingFindings.length
+      ? view.remainingBlockingFindings
+      : Array.isArray(view?.findings)
+        ? view.findings.filter(isBlockingLike)
         : [];
   return source.slice(0, maxItems).map((f, idx) => ({
     id: f.id || `F${idx + 1}`,
@@ -357,51 +385,52 @@ function buildBlockingPreview(payload, maxItems = 6) {
 }
 
 function buildMinimalSummary(toolName, payload, originalBytes, maxBytes) {
-  const recallFull = buildRecallPointer(toolName, payload);
-  const rawJobId = payload?.jobId || payload?.job?.id || null;
-  const rawHandoffId = payload?.handoffId || payload?.packet?.handoffId || null;
-  const rawPatchPath = payload?.patchPath || payload?.job?.patchPath || null;
-  const rawWorktreePath = payload?.worktreePath || payload?.job?.worktreePath || null;
-  const rawDeliverableMode = payload?.deliverableMode || payload?.job?.deliverableMode || null;
-  const rawIgnoredOnly = payload?.ignoredOnlyDeliverables ?? payload?.job?.ignoredOnlyDeliverables;
-  const rawIgnoredFiles = payload?.ignoredFiles || payload?.job?.ignoredFiles;
-  const rawReviewId = payload?.reviewId || null;
+  const view = unwrapJobPayload(payload);
+  const recallFull = buildRecallPointer(toolName, view);
+  const rawJobId = view?.jobId || view?.job?.id || view?.id || null;
+  const rawHandoffId = view?.handoffId || view?.packet?.handoffId || null;
+  const rawPatchPath = view?.patchPath || view?.job?.patchPath || null;
+  const rawWorktreePath = view?.worktreePath || view?.job?.worktreePath || null;
+  const rawDeliverableMode = view?.deliverableMode || view?.job?.deliverableMode || null;
+  const rawIgnoredOnly = view?.ignoredOnlyDeliverables ?? view?.job?.ignoredOnlyDeliverables;
+  const rawIgnoredFiles = view?.ignoredFiles || view?.job?.ignoredFiles;
+  const rawReviewId = view?.reviewId || null;
 
   const totalFindings =
-    payload?.totalFindings ??
-    (Array.isArray(payload?.findings)
-      ? payload.findings.length
-      : (Array.isArray(payload?.blockingFindings) || Array.isArray(payload?.advisoryFindings))
-        ? (payload?.blockingFindings?.length ?? 0) + (payload?.advisoryFindings?.length ?? 0)
-        : Array.isArray(payload?.remainingBlockingFindings)
-          ? payload.remainingBlockingFindings.length
+    view?.totalFindings ??
+    (Array.isArray(view?.findings)
+      ? view.findings.length
+      : (Array.isArray(view?.blockingFindings) || Array.isArray(view?.advisoryFindings))
+        ? (view?.blockingFindings?.length ?? 0) + (view?.advisoryFindings?.length ?? 0)
+        : Array.isArray(view?.remainingBlockingFindings)
+          ? view.remainingBlockingFindings.length
           : null);
   const blockingCount =
-    payload?.blockingCount ??
-    (Array.isArray(payload?.blockingFindings)
-      ? payload.blockingFindings.length
-      : Array.isArray(payload?.remainingBlockingFindings)
-        ? payload.remainingBlockingFindings.length
-        : Array.isArray(payload?.findings)
-          ? payload.findings.filter(isBlockingLike).length
+    view?.blockingCount ??
+    (Array.isArray(view?.blockingFindings)
+      ? view.blockingFindings.length
+      : Array.isArray(view?.remainingBlockingFindings)
+        ? view.remainingBlockingFindings.length
+        : Array.isArray(view?.findings)
+          ? view.findings.filter(isBlockingLike).length
           : null);
   const advisoryCount =
-    payload?.advisoryCount ??
-    (Array.isArray(payload?.advisoryFindings)
-      ? payload.advisoryFindings.length
+    view?.advisoryCount ??
+    (Array.isArray(view?.advisoryFindings)
+      ? view.advisoryFindings.length
       : totalFindings != null && blockingCount != null
         ? totalFindings - blockingCount
         : null);
 
-  const blockingPreview = buildBlockingPreview(payload, 5);
+  const blockingPreview = buildBlockingPreview(view, 5);
 
   const base = {
-    ...(typeof payload?.ok === "boolean" ? { ok: payload.ok } : {}),
-    ...(payload?.status ? { status: sliceUtf8Bytes(String(payload.status), 32) } : {}),
+    ...(typeof view?.ok === "boolean" ? { ok: view.ok } : {}),
+    ...(view?.status ? { status: sliceUtf8Bytes(String(view.status), 32) } : {}),
     ...(rawReviewId ? { reviewId: sliceUtf8Bytes(String(rawReviewId), 96) } : {}),
-    ...(payload?.artifactPath ? { artifactPath: truncateWithByteNotice(String(payload.artifactPath), Math.min(200, Math.floor(maxBytes / 4))) } : {}),
-    ...(payload?.cycleId ? { cycleId: sliceUtf8Bytes(String(payload.cycleId), 64) } : {}),
-    ...(payload?.round != null ? { round: payload.round } : {}),
+    ...(view?.artifactPath ? { artifactPath: truncateWithByteNotice(String(view.artifactPath), Math.min(200, Math.floor(maxBytes / 4))) } : {}),
+    ...(view?.cycleId ? { cycleId: sliceUtf8Bytes(String(view.cycleId), 64) } : {}),
+    ...(view?.round != null ? { round: view.round } : {}),
     ...(rawJobId ? { jobId: sliceUtf8Bytes(String(rawJobId), 96) } : {}),
     ...(rawHandoffId ? { handoffId: sliceUtf8Bytes(String(rawHandoffId), 96) } : {}),
     ...(rawPatchPath ? { patchPath: truncateWithByteNotice(String(rawPatchPath), Math.min(200, Math.floor(maxBytes / 4))) } : {}),
@@ -411,21 +440,21 @@ function buildMinimalSummary(toolName, payload, originalBytes, maxBytes) {
     ...(Array.isArray(rawIgnoredFiles) && rawIgnoredFiles.length
       ? { ignoredFiles: rawIgnoredFiles.slice(0, 6).map((f) => sliceUtf8Bytes(String(f), 80)) }
       : {}),
-    ...(payload?.verdict ? { verdict: sliceUtf8Bytes(String(payload.verdict), 32) } : {}),
-    ...(payload?.decision ? { decision: sliceUtf8Bytes(String(payload.decision), 32) } : {}),
+    ...(view?.verdict ? { verdict: sliceUtf8Bytes(String(view.verdict), 32) } : {}),
+    ...(view?.decision ? { decision: sliceUtf8Bytes(String(view.decision), 32) } : {}),
     ...(totalFindings != null ? { totalFindings } : {}),
     ...(blockingCount != null ? { blockingCount } : {}),
     ...(advisoryCount != null ? { advisoryCount } : {}),
     ...(blockingPreview.length > 0 ? { blockingPreview } : {}),
-    ...(payload?.designId ? { designId: sliceUtf8Bytes(String(payload.designId), 96) } : {}),
-    ...(payload?.gateKey ? { gateKey: sliceUtf8Bytes(String(payload.gateKey), 96) } : {}),
-    ...(payload?.sessionId ? { sessionId: sliceUtf8Bytes(String(payload.sessionId), 96) } : {}),
-    ...(payload?.durationMs != null ? { durationMs: payload.durationMs } : {}),
-    ...(Array.isArray(payload?.changedFiles) ? { changedFiles: payload.changedFiles.slice(0, 8).map((f) => sliceUtf8Bytes(String(f), 80)) } : {}),
-    ...(Array.isArray(payload?.scopeViolations) && payload.scopeViolations.length
-      ? { scopeViolations: payload.scopeViolations.slice(0, 3).map((v) => sliceUtf8Bytes(String(v), 100)) }
+    ...(view?.designId ? { designId: sliceUtf8Bytes(String(view.designId), 96) } : {}),
+    ...(view?.gateKey ? { gateKey: sliceUtf8Bytes(String(view.gateKey), 96) } : {}),
+    ...(view?.sessionId ? { sessionId: sliceUtf8Bytes(String(view.sessionId), 96) } : {}),
+    ...(view?.durationMs != null ? { durationMs: view.durationMs } : {}),
+    ...(Array.isArray(view?.changedFiles) ? { changedFiles: view.changedFiles.slice(0, 8).map((f) => sliceUtf8Bytes(String(f), 80)) } : {}),
+    ...(Array.isArray(view?.scopeViolations) && view.scopeViolations.length
+      ? { scopeViolations: view.scopeViolations.slice(0, 3).map((v) => sliceUtf8Bytes(String(v), 100)) }
       : {}),
-    ...(payload?.error ? { error: truncateWithByteNotice(payload.error, Math.min(240, Math.floor(maxBytes / 5))) } : {}),
+    ...(view?.error ? { error: truncateWithByteNotice(view.error, Math.min(240, Math.floor(maxBytes / 5))) } : {}),
     _compacted: true,
     _originalBytes: originalBytes,
     _recall: truncateWithByteNotice(recallFull, Math.min(220, Math.floor(maxBytes / 4)))
@@ -506,6 +535,10 @@ export function compactMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxB
   pass1._compacted = true;
   pass1._originalBytes = originalBytes;
   pass1._recall = buildRecallPointer(toolName, payload);
+  const preview1 = buildBlockingPreview(payload, 5);
+  if (preview1.length > 0 && pass1.blockingPreview === undefined) {
+    pass1.blockingPreview = preview1;
+  }
   if (Buffer.byteLength(JSON.stringify(pass1), "utf8") <= budget) {
     return pass1;
   }
@@ -518,6 +551,12 @@ export function compactMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxB
   pass2._compacted = true;
   pass2._originalBytes = originalBytes;
   pass2._recall = buildRecallPointer(toolName, payload);
+  if (preview1.length > 0 && pass2.blockingPreview === undefined) {
+    const withPreview = { ...pass2, blockingPreview: preview1 };
+    if (Buffer.byteLength(JSON.stringify(withPreview), "utf8") <= budget) {
+      return withPreview;
+    }
+  }
   if (Buffer.byteLength(JSON.stringify(pass2), "utf8") <= budget) {
     return pass2;
   }

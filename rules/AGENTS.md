@@ -20,8 +20,8 @@ Use the `trirelay` MCP tools (preferring eager core tools directly without readi
 - `relay_models`: `{ includeHidden?, includeAgyProbe? }`
 - `relay_route`: `{ host?, excludeHost?, profile?, spec?, engine?, model?, effort?, mode?, authorEngine?, strict? }`
 - `relay_run`: `{ prompt, cwd?, host?, background?, role?, workflowId?, boardId?, profile?, spec?, engine?, model?, effort?, mode?: "readonly"|"write", ownedFiles?, forbiddenFiles?, invariants?, decisionsMade?, doNotRelitigate?, acceptanceCriteria?, handoffId?, parentHandoffId?, handoff?, includeHostDigest?, includeRepoHandoff?, includeBoardDigest?, resumeRole?, resumeSessionId?, forkSession?, outputSchema?, timeoutMs? }`
-- `relay_review`: `{ action?: "run"|"inspect", reviewId?, offset?, limit?, severity?, cwd?, host?, background?, engine?: "both"|"agy"|"claude"|"codex", scope?: "auto"|"working-tree"|"branch", base?, focus?, model?, effort?, native? }`
-- `relay_review_gate`: `{ action?: "run"|"inspect", reviewId?, offset?, limit?, severity?, cwd?, host?, background?, gateKey?, workflowId?, maxRounds?: 2, reset?, engine?, scope?, base?, focus?, effort? }`
+- `relay_review`: `{ action?: "run"|"inspect", reviewId?, offset?, limit?, severity?, cwd?, host?, background?, engine?: "both"|"agy"|"claude"|"codex", scope?: "auto"|"working-tree"|"branch", base?, focus?, model?, effort?, native?, timeoutMs? }`
+- `relay_review_gate`: `{ action?: "run"|"inspect", reviewId?, offset?, limit?, severity?, cwd?, host?, background?, gateKey?, workflowId?, maxRounds?: 2, reset?, engine?, scope?, base?, focus?, effort?, timeoutMs? }`
 - `relay_design`: `{ action: "start"|"submit_host"|"reveal", cwd?, host?, background?, designId?, requirement?, contextPaths?, advisorSpec?, hostDraft?, hostDraftPath? }`
 - `relay_copy_review`: `{ cwd?, host?, content?, filePath?, audience?, purpose?, advisorSpec?, workflowId? }`
 - `relay_orchestrate`: `{ pattern: "teamwork"|"boost"|"swarm"|"pipeline", cwd?, host?, background?, workflowId?, boardId?, goal?, prompt?, models?, crossCritique?, crossVerify?, tasks?, workers?, stages?, maxConcurrency?, maxPerEngine?, timeoutMs? }`

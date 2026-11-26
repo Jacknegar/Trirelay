@@ -157,24 +157,46 @@ export function resolveInheritedConstraints(workspaceRoot, parentHandoffId, inpu
   const depInvAll = new Set();
 
   for (const hop of [...chain, input]) {
-    for (const sup of dedupeStrings(hop.supersededDecisions ?? [])) {
+    const hopSup = new Set(dedupeStrings(hop.supersededDecisions ?? []));
+    const hopDepInv = new Set(dedupeStrings(hop.deprecatedInvariants ?? []));
+    const hopInv = dedupeStrings(hop.invariants ?? []);
+    const hopDec = dedupeStrings(hop.decisionsMade ?? []);
+    const hopDnr = dedupeStrings(hop.doNotRelitigate ?? []);
+
+    for (const dec of hopDec) {
+      if (hopSup.has(dec)) {
+        throw new Error(`Conflicting same-hop handoff constraint "${dec}" declared in both decisionsMade and supersededDecisions.`);
+      }
+    }
+    for (const dnr of hopDnr) {
+      if (hopSup.has(dnr)) {
+        throw new Error(`Conflicting same-hop handoff constraint "${dnr}" declared in both doNotRelitigate and supersededDecisions.`);
+      }
+    }
+    for (const inv of hopInv) {
+      if (hopDepInv.has(inv)) {
+        throw new Error(`Conflicting same-hop handoff constraint "${inv}" declared in both invariants and deprecatedInvariants.`);
+      }
+    }
+
+    for (const sup of hopSup) {
       supAll.add(sup);
       decSet.delete(sup);
       dnrSet.delete(sup);
     }
-    for (const dep of dedupeStrings(hop.deprecatedInvariants ?? [])) {
+    for (const dep of hopDepInv) {
       depInvAll.add(dep);
       invSet.delete(dep);
     }
-    for (const inv of dedupeStrings(hop.invariants ?? [])) {
+    for (const inv of hopInv) {
       depInvAll.delete(inv);
       invSet.add(inv);
     }
-    for (const dec of dedupeStrings(hop.decisionsMade ?? [])) {
+    for (const dec of hopDec) {
       supAll.delete(dec);
       decSet.add(dec);
     }
-    for (const dnr of dedupeStrings(hop.doNotRelitigate ?? [])) {
+    for (const dnr of hopDnr) {
       supAll.delete(dnr);
       dnrSet.add(dnr);
     }

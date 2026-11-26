@@ -303,8 +303,19 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
     );
   }
 
-  // Resolve prior session ID BEFORE acquiring a lease; after lease acquisition we re-read
-  // `sessionEntry` from disk to prevent TOCTOU races with a finishing concurrent writer.
+  // Validate handoff references BEFORE acquiring leases or creating any worktree so invalid inputs cannot leak checkouts.
+  if (params.handoffId && params.parentHandoffId) {
+    throw new Error('Cannot specify both "handoffId" and "parentHandoffId" in the same task.');
+  }
+  if (params.handoffId && !loadHandoffPacket(workspaceRoot, params.handoffId)) {
+    throw new Error(`Handoff packet "${params.handoffId}" not found.`);
+  }
+  if (params.parentHandoffId && !loadHandoffPacket(workspaceRoot, params.parentHandoffId)) {
+    throw new Error(`Parent handoff packet "${params.parentHandoffId}" not found.`);
+  }
+
+  // Resolve prior session ID and ALWAYS canonicalize via `bySession` (`lookupSessionById`)
+  // for BOTH fork and non-fork resumes; re-read after lease acquisition to close TOCTOU.
   let resumeSessionId = params.resumeSessionId || null;
   let sessionEntry = null;
   const loadTargetSession = () => {
@@ -319,6 +330,7 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
       });
       if (byRole?.sessionId) {
         resumeSessionId = byRole.sessionId;
+        return lookupSessionById(workspaceRoot, { engine: route.primary.engine, sessionId: resumeSessionId }) || byRole;
       }
       return byRole;
     }
@@ -347,6 +359,7 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
 
   let worktree = null;
   let effectiveCwd = workspaceRoot;
+  let driverStarted = false;
 
   try {
     if (useWorktree) {
@@ -369,27 +382,22 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
           };
           appendJobLog(logFile, `Reusing bound worktree at ${worktree.worktreePath} (base=${worktree.baseSha})`);
         } else if (sessionEntry.patchPath && fs.existsSync(sessionEntry.patchPath) && sessionEntry.baseSha) {
-          if (sessionEntry.patchSha256) {
-            const actualSha = createHash("sha256").update(fs.readFileSync(sessionEntry.patchPath)).digest("hex");
-            if (actualSha !== sessionEntry.patchSha256) {
-              throw new Error(
-                `Cannot resume write session "${resumeSessionId}": patch integrity check failed for ${sessionEntry.patchPath}.`
-              );
-            }
-          }
           worktree = createIsolatedWorktree(workspaceRoot, {
             id: `${role}-${jobId}`.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 72),
             branch: params.worktreeBranch || null,
             baseSha: sessionEntry.baseSha
           });
           try {
-            applyPatchToWorktree(worktree.worktreePath, sessionEntry.patchPath);
+            applyPatchToWorktree(worktree.worktreePath, sessionEntry.patchPath, {
+              expectedSha256: sessionEntry.patchSha256 || null
+            });
             appendJobLog(logFile, `Replayed prior patch ${sessionEntry.patchPath} onto worktree ${worktree.worktreePath}`);
           } catch (replayErr) {
             removeIsolatedWorktree(workspaceRoot, worktree.worktreePath);
             throw replayErr;
           }
         } else if (
+          sessionEntry.captureComplete !== false &&
           sessionEntry.deliverableMode === "none" &&
           !sessionEntry.patchPath &&
           sessionEntry.baseSha &&
@@ -519,6 +527,7 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
     let finalResult = null;
     let usedTarget = route.primary;
     const attempts = [];
+    driverStarted = true;
 
     for (let i = 0; i < candidates.length; i += 1) {
       if (signal?.aborted) {
@@ -603,8 +612,9 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
       if ((worktreeDiff.changedFiles ?? []).length > 0) {
         scopeViolations.push(...auditFileScope(worktreeDiff.changedFiles, { ownedFiles, forbiddenFiles }));
       }
-      if ((worktreeDiff.ignoredFiles ?? []).length > 0) {
-        scopeViolations.push(...auditFileScope(worktreeDiff.ignoredFiles, { ownedFiles: [], forbiddenFiles }));
+      const allIgnoredForAudit = worktreeDiff.allIgnoredFiles ?? worktreeDiff.ignoredFiles ?? [];
+      if (allIgnoredForAudit.length > 0) {
+        scopeViolations.push(...auditFileScope(allIgnoredForAudit, { ownedFiles: [], forbiddenFiles }));
       }
       if (worktreeDiff.captureComplete && !worktreeDiff.hasChanges && !worktree.reused && params.keepEmptyWorktree !== true) {
         removeIsolatedWorktree(workspaceRoot, worktree.worktreePath);
@@ -616,6 +626,7 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
       worktree && (worktreeDiff.hasChanges || worktree.reused || !worktreeDiff.captureComplete || params.keepEmptyWorktree)
         ? worktree.worktreePath
         : null;
+    const finalDeliverableMode = worktree && !worktreeDiff.captureComplete ? "incomplete" : (worktreeDiff.deliverableMode ?? "none");
 
     if (finalResult?.sessionId) {
       recordRoleSession(workspaceRoot, {
@@ -631,8 +642,9 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
         baseSha: worktree?.baseSha ?? null,
         patchPath: worktreeDiff.patchPath,
         patchSha256: worktreeDiff.patchSha256 ?? null,
-        deliverableMode: worktreeDiff.deliverableMode ?? "none",
+        deliverableMode: finalDeliverableMode,
         finalHeadSha: worktreeDiff.finalHeadSha,
+        captureComplete: worktreeDiff.captureComplete,
         isWriteRun: Boolean(worktree)
       });
     }
@@ -673,11 +685,12 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
       finalHeadSha: worktreeDiff.finalHeadSha,
       patchPath: worktreeDiff.patchPath,
       patchSha256: worktreeDiff.patchSha256 ?? null,
-      deliverableMode: worktreeDiff.deliverableMode ?? "none",
-      ignoredOnlyDeliverables: Boolean(worktreeDiff.ignoredOnlyDeliverables),
+      deliverableMode: finalDeliverableMode,
+      ignoredOnlyDeliverables: Boolean(worktreeDiff.captureComplete && worktreeDiff.ignoredOnlyDeliverables),
       diffStat: worktreeDiff.diffStat,
       changedFiles: worktreeDiff.changedFiles.length ? worktreeDiff.changedFiles : finalResult?.touchedFiles ?? [],
       ignoredFiles: worktreeDiff.ignoredFiles ?? [],
+      ignoredFilesTotal: worktreeDiff.ignoredFilesTotal ?? (worktreeDiff.ignoredFiles?.length ?? 0),
       ownedFiles,
       forbiddenFiles,
       scopeViolations
@@ -725,6 +738,13 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
 
     return normalized;
   } catch (err) {
+    if (worktree && !worktree.reused && !driverStarted) {
+      try {
+        removeIsolatedWorktree(workspaceRoot, worktree.worktreePath);
+      } catch {
+        // Ignore cleanup failure when throwing pre-flight error.
+      }
+    }
     const errMsg = err instanceof Error ? err.message : String(err);
     upsertJob(workspaceRoot, {
       id: jobId,
@@ -992,6 +1012,7 @@ export async function runDualReview(cwd, params = {}, internalOpts = {}) {
       focus,
       model: params.model ?? null,
       effort: params.effort ?? "high",
+      timeoutMs: params.timeoutMs,
       signal
     });
   }
@@ -1061,6 +1082,7 @@ export async function runDualReview(cwd, params = {}, internalOpts = {}) {
         allowFallback: false,
         prompt: reviewPrompt,
         outputSchema: REVIEW_SCHEMA,
+        timeoutMs: params.timeoutMs,
         workflowId: params.workflowId || "review"
       },
       { signal }
@@ -1089,6 +1111,13 @@ export async function runDualReview(cwd, params = {}, internalOpts = {}) {
 
   const blockingCount = mergedFindings.filter((f) => isBlockingSeverity(f.severity)).length;
   const advisoryCount = mergedFindings.length - blockingCount;
+  const gateDecision = params.gateMeta
+    ? !allSucceededWithSchema
+      ? "incomplete"
+      : blockingCount > 0 || verdict === "needs-attention"
+        ? "fix_required"
+        : "pass"
+    : null;
   const payload = {
     ok: allSucceededWithSchema,
     reviewId,
@@ -1099,6 +1128,7 @@ export async function runDualReview(cwd, params = {}, internalOpts = {}) {
     target: diffCtx.targetLabel,
     artifactDigest,
     verdict,
+    ...(gateDecision ? { decision: gateDecision } : {}),
     totalFindings: mergedFindings.length,
     blockingCount,
     advisoryCount,
@@ -1141,6 +1171,16 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
   const gateKey = validateOpaqueId(params.gateKey || params.workflowId || "default-gate", "gateKey");
   const maxRounds = Math.max(1, Math.min(5, Number(params.maxRounds ?? routing.defaults?.maxReviewGateRounds ?? 2)));
 
+  const isPidLive = (pid) => {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (e) {
+      return e?.code === "EPERM";
+    }
+  };
+
   if (params.reset) {
     saveReviewGateState(workspaceRoot, gateKey, {
       gateKey,
@@ -1148,15 +1188,20 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
       cycleId: null,
       status: "passed",
       round: 0,
+      pendingReservations: [],
       history: [],
       completedCycles: []
     });
     return { ok: true, gateKey, reset: true, round: 0 };
   }
 
-  // Reserve round number atomically BEFORE executing review. A passed cycle
-  // automatically closes and rolls into a fresh cycle instead of falsely escalating.
+  // Reserve an in-flight token atomically BEFORE executing review without prematurely
+  // counting pending work as completed rounds. A passed cycle automatically starts a fresh cycle.
+  const reservationToken = generateId("res");
   const reservation = withReviewGateLock(workspaceRoot, gateKey, (state, save) => {
+    const livePending = (Array.isArray(state.pendingReservations) ? state.pendingReservations : []).filter(
+      (p) => p && isPidLive(p.pid)
+    );
     const startFreshCycle = !state.cycleId || state.status === "passed";
     if (startFreshCycle) {
       const completedCycles = Array.isArray(state.completedCycles) ? [...state.completedCycles] : [];
@@ -1171,27 +1216,49 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
       }
       const nextCycleNum = (state.cycleNumber || 0) + 1;
       const nextCycleId = generateId("cyc");
+      const entry = { token: reservationToken, round: 1, pid: process.pid, startedAt: nowIso() };
       save({
         gateKey,
         cycleNumber: nextCycleNum,
         cycleId: nextCycleId,
         status: "open",
-        round: 1,
+        round: 0,
+        pendingReservations: [entry],
         history: [],
         completedCycles: completedCycles.slice(-10)
       });
-      return { escalated: false, round: 1, cycleId: nextCycleId, cycleNumber: nextCycleNum };
+      return { escalated: false, inProgress: false, round: 1, cycleId: nextCycleId, cycleNumber: nextCycleNum };
     }
 
-    const nextRound = (state.round || 0) + 1;
-    if (nextRound > maxRounds) {
-      const lastEntry = state.history?.at(-1) ?? {};
+    const historyArr = Array.isArray(state.history) ? state.history : [];
+    const completedCounted = historyArr.filter((h) => h.counted !== false).length;
+    if (completedCounted >= maxRounds) {
+      const lastEntry = [...historyArr].reverse().find((h) => h.counted !== false) ?? historyArr.at(-1) ?? {};
       const remainingBlocking = (lastEntry.findings ?? []).filter((f) => isBlockingSeverity(f.severity));
-      save({ ...state, status: "escalated" });
-      return { escalated: true, state, lastEntry, remainingBlocking };
+      save({ ...state, status: "escalated", round: completedCounted, pendingReservations: livePending });
+      return { escalated: true, inProgress: false, state: { ...state, round: completedCounted }, lastEntry, remainingBlocking };
     }
-    save({ ...state, gateKey, status: "open", round: nextRound });
-    return { escalated: false, round: nextRound, cycleId: state.cycleId, cycleNumber: state.cycleNumber || 1 };
+
+    if (completedCounted + livePending.length >= maxRounds) {
+      save({ ...state, round: completedCounted, pendingReservations: livePending });
+      return {
+        escalated: false,
+        inProgress: true,
+        state: { ...state, round: completedCounted },
+        pendingCount: livePending.length
+      };
+    }
+
+    const nextRound = completedCounted + livePending.length + 1;
+    const entry = { token: reservationToken, round: nextRound, pid: process.pid, startedAt: nowIso() };
+    save({
+      ...state,
+      gateKey,
+      status: "open",
+      round: completedCounted,
+      pendingReservations: [...livePending, entry]
+    });
+    return { escalated: false, inProgress: false, round: nextRound, cycleId: state.cycleId, cycleNumber: state.cycleNumber || 1 };
   });
 
   if (reservation.escalated) {
@@ -1213,21 +1280,46 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
     };
   }
 
-  const review = await runDualReview(
-    workspaceRoot,
-    {
-      ...params,
-      engine: params.engine || "both",
-      gateMeta: {
-        gateKey,
-        cycleId: reservation.cycleId,
-        cycleNumber: reservation.cycleNumber,
-        round: reservation.round,
-        maxRounds
-      }
-    },
-    internalOpts
-  );
+  if (reservation.inProgress) {
+    return {
+      ok: false,
+      gateKey,
+      cycleId: reservation.state.cycleId ?? null,
+      cycleNumber: reservation.state.cycleNumber ?? 1,
+      decision: "in_progress",
+      round: reservation.state.round,
+      pendingCount: reservation.pendingCount,
+      maxRounds,
+      message: `Review gate round is already in progress (${reservation.pendingCount} active review(s), maxRounds=${maxRounds}); wait for completion instead of escalating prematurely.`
+    };
+  }
+
+  let review;
+  try {
+    review = await runDualReview(
+      workspaceRoot,
+      {
+        ...params,
+        engine: params.engine || "both",
+        gateMeta: {
+          gateKey,
+          cycleId: reservation.cycleId,
+          cycleNumber: reservation.cycleNumber,
+          round: reservation.round,
+          maxRounds
+        }
+      },
+      internalOpts
+    );
+  } catch (err) {
+    withReviewGateLock(workspaceRoot, gateKey, (latest, save) => {
+      const remainingPending = (Array.isArray(latest.pendingReservations) ? latest.pendingReservations : []).filter(
+        (p) => p && p.token !== reservationToken && isPidLive(p.pid)
+      );
+      save({ ...latest, pendingReservations: remainingPending });
+    });
+    throw err;
+  }
 
   const blockingFindings = review.findings.filter((f) => isBlockingSeverity(f.severity));
   const advisoryFindings = review.findings.filter((f) => !isBlockingSeverity(f.severity));
@@ -1239,14 +1331,19 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
 
   let staleCompletion = false;
   withReviewGateLock(workspaceRoot, gateKey, (latest, save) => {
+    const remainingPending = (Array.isArray(latest.pendingReservations) ? latest.pendingReservations : []).filter(
+      (p) => p && p.token !== reservationToken && isPidLive(p.pid)
+    );
+
     // Compare-and-set on cycleId: ignore stale late completions if a newer cycle
     // started or if the target cycle has already passed.
     if (latest.cycleId !== reservation.cycleId || latest.status === "passed") {
+      save({ ...latest, pendingReservations: remainingPending });
       staleCompletion = true;
       return;
     }
 
-    const history = [
+    const rawHistory = [
       ...(latest.history ?? []),
       {
         round: reservation.round,
@@ -1262,17 +1359,18 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
       }
     ].sort((a, b) => (a.round ?? 0) - (b.round ?? 0));
 
-    const nextRoundCount =
-      decision === "incomplete"
-        ? Math.max(0, (latest.round || reservation.round) - 1)
-        : Math.max(latest.round || 0, reservation.round);
+    // Keep all counted rounds plus at most the 10 most recent incomplete attempts.
+    const countedEntries = rawHistory.filter((h) => h.counted !== false);
+    const incompleteEntries = rawHistory.filter((h) => h.counted === false).slice(-10);
+    const history = [...countedEntries, ...incompleteEntries].sort((a, b) => (a.round ?? 0) - (b.round ?? 0));
 
     save({
       gateKey,
       cycleId: reservation.cycleId,
       cycleNumber: reservation.cycleNumber,
       status: decision === "pass" ? "passed" : "open",
-      round: nextRoundCount,
+      round: countedEntries.length,
+      pendingReservations: remainingPending,
       history,
       completedCycles: latest.completedCycles ?? []
     });
@@ -1301,9 +1399,10 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
   };
 }
 
-export async function runDualDesign(cwd, params = {}) {
+export async function runDualDesign(cwd, params = {}, internalOpts = {}) {
   assertRecursionSafe(cwd);
   validateCallerArgs(params);
+  const signal = internalOpts.signal ?? null;
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const action = params.action || "start";
@@ -1349,15 +1448,19 @@ export async function runDualDesign(cwd, params = {}) {
       .filter(Boolean)
       .join("\n");
 
-    const advisorResult = await runSingleTask(workspaceRoot, {
-      role: "advisor",
-      profile: params.advisorSpec ? null : "advisor",
-      spec: params.advisorSpec ?? null,
-      mode: "readonly",
-      host,
-      workflowId: designId,
-      prompt: advisorPrompt
-    });
+    const advisorResult = await runSingleTask(
+      workspaceRoot,
+      {
+        role: "advisor",
+        profile: params.advisorSpec ? null : "advisor",
+        spec: params.advisorSpec ?? null,
+        mode: "readonly",
+        host,
+        workflowId: designId,
+        prompt: advisorPrompt
+      },
+      { signal }
+    );
 
     updateDesignVault(workspaceRoot, designId, (cur) => ({
       ...cur,
@@ -1443,9 +1546,10 @@ export async function runDualDesign(cwd, params = {}) {
   throw new Error(`Unknown relay_design action: "${action}". Use start | submit_host | reveal.`);
 }
 
-export async function runCopyReview(cwd, params = {}) {
+export async function runCopyReview(cwd, params = {}, internalOpts = {}) {
   assertRecursionSafe(cwd);
   validateCallerArgs(params);
+  const signal = internalOpts.signal ?? null;
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const host = resolveHost(params.host);
@@ -1464,23 +1568,27 @@ export async function runCopyReview(cwd, params = {}) {
   const audience = params.audience || "developers / end users";
   const purpose = params.purpose || "clear, accurate, concise technical/UI communication";
 
-  const res = await runSingleTask(workspaceRoot, {
-    role: "copy-reviewer",
-    profile: params.advisorSpec ? null : "advisor",
-    spec: params.advisorSpec ?? null,
-    mode: "readonly",
-    host,
-    outputSchema: COPY_REVIEW_SCHEMA,
-    workflowId: params.workflowId || "copy-review",
-    prompt: [
-      "Review the draft copy below for clarity, conciseness, and factual discipline.",
-      `Target audience: ${audience}`,
-      `Purpose: ${purpose}`,
-      "Guidelines: keep status labels concise (2-4 chars/words); move explanatory detail to helper text; remove filler; do not invent features.",
-      "Return strictly JSON matching the schema (`summary`, `rows[{location, current, problem, suggestion}]`).",
-      `\nDraft:\n${target}`
-    ].join("\n")
-  });
+  const res = await runSingleTask(
+    workspaceRoot,
+    {
+      role: "copy-reviewer",
+      profile: params.advisorSpec ? null : "advisor",
+      spec: params.advisorSpec ?? null,
+      mode: "readonly",
+      host,
+      outputSchema: COPY_REVIEW_SCHEMA,
+      workflowId: params.workflowId || "copy-review",
+      prompt: [
+        "Review the draft copy below for clarity, conciseness, and factual discipline.",
+        `Target audience: ${audience}`,
+        `Purpose: ${purpose}`,
+        "Guidelines: keep status labels concise (2-4 chars/words); move explanatory detail to helper text; remove filler; do not invent features.",
+        "Return strictly JSON matching the schema (`summary`, `rows[{location, current, problem, suggestion}]`).",
+        `\nDraft:\n${target}`
+      ].join("\n")
+    },
+    { signal }
+  );
 
   return {
     ok: Boolean(res.ok && res.structuredOutput),

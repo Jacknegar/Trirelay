@@ -404,7 +404,7 @@ async function main() {
     case "apply": {
       const jobId = positionals[0] || options.id;
       if (!jobId) throw new Error("Usage: trirelay apply <jobId> [--mode check|apply]");
-      const detail = await handleJobControl(cwd, { action: "result", jobId });
+      const detail = await handleJobControl(cwd, { action: "result", jobId, exact: true });
       printOutput(applyJobPatch(cwd, detail.job, { mode: options.mode || "check" }), true);
       break;
     }

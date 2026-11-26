@@ -112,10 +112,12 @@ const {
   readActiveBoardPins,
   readBoardPosts,
   readBoardPostsBySeqs,
+  readJobDetail,
   recordRoleSession,
   releaseSessionLease,
   resolveBoardFile,
   resolveBoardPinsFile,
+  saveReviewArtifact,
   sessionLedgerPath,
   writeJsonAtomic
 } = await import("../core/state.mjs");
@@ -831,7 +833,28 @@ async function testReleaseGateStateConsistencySuite() {
       ),
     /apply-time scope re-audit/i
   );
-  assert.ok(extractPatchTouchedFiles(fs.readFileSync(r1Turn1.patchPath, "utf8")).includes("src/feature.txt"));
+  assert.ok(extractPatchTouchedFiles(fs.readFileSync(r1Turn1.patchPath, "utf8"), REPO_DIR).includes("src/feature.txt"));
+
+  // Round 2 B1: SQL `--` comment deletion (`---`) & Unicode path (`src/café.js`) must pass authoritative numstat audit & apply; legacy patch without patchSha256 rejected on apply
+  const wtSql = createIsolatedWorktree(REPO_DIR, { id: `wt-sql-${Date.now()}` });
+  try {
+    fs.writeFileSync(path.join(wtSql.worktreePath, "src", "query.sql"), "-- legacy comment\nSELECT 1;\n");
+    runSync("git", ["add", "src/query.sql"], { cwd: wtSql.worktreePath });
+    runSync("git", ["commit", "-m", "add sql"], { cwd: wtSql.worktreePath });
+    const sqlBaseSha = runSync("git", ["rev-parse", "HEAD"], { cwd: wtSql.worktreePath }).stdout.trim();
+    fs.writeFileSync(path.join(wtSql.worktreePath, "src", "query.sql"), "SELECT 1;\n");
+    fs.writeFileSync(path.join(wtSql.worktreePath, "src", "café.js"), "export const cafe = 1;\n");
+    const sqlCap = captureWorktreeChanges(REPO_DIR, wtSql.worktreePath, wtSql.worktreeId, sqlBaseSha, { patchId: `sql-${Date.now()}` });
+    const sqlTouched = extractPatchTouchedFiles(fs.readFileSync(sqlCap.patchPath), REPO_DIR);
+    assert.deepEqual(sqlTouched.sort(), ["src/café.js", "src/query.sql"].sort(), `Unexpected parsed files: ${JSON.stringify(sqlTouched)}`);
+    assert.equal(auditFileScope(sqlTouched, { ownedFiles: ["src/query.sql", "src/café.js"], forbiddenFiles: ["docs/handoff.md"] }).length, 0);
+  } finally {
+    removeIsolatedWorktree(REPO_DIR, wtSql.worktreePath);
+  }
+  assert.throws(
+    () => applyJobPatch(REPO_DIR, { ...r1Turn1, status: "completed", patchSha256: null }, { mode: "apply" }),
+    /without patchSha256/i
+  );
 
   // B2: Fresh session under same (workflow, role, engine) does not inherit prior patch/worktree,
   // old sessionId stays in lookup, cross-role readonly keeps write binding, and live-PID lease never expires early.
@@ -890,6 +913,89 @@ async function testReleaseGateStateConsistencySuite() {
   );
   releaseSessionLease(REPO_DIR, "codex", "sess-b2-lease", "owner-1");
 
+  // Round 2 B2: Legacy `entries`-only ledger hydrates bySession across readonly cross-role resume;
+  // fork via resumeRole uses canonical bySession; captureComplete=false produces deliverableMode="incomplete".
+  const legacyLedger = JSON.parse(fs.readFileSync(ledgerFileB2, "utf8"));
+  delete legacyLedger.bySession["codex::sess-b2-legacy"];
+  legacyLedger.entries["wf-leg::impl::codex"] = {
+    workflowId: "wf-leg",
+    role: "impl",
+    engine: "codex",
+    sessionId: "sess-b2-legacy",
+    sessionCwd: REPO_DIR,
+    worktreeId: "wt-leg",
+    worktreePath: r1Replay.worktreePath,
+    baseSha: r1Turn1.baseSha,
+    patchPath: r1Turn1.patchPath,
+    patchSha256: r1Turn1.patchSha256,
+    deliverableMode: "patch",
+    finalHeadSha: r1Turn1.finalHeadSha,
+    hadWorktree: true,
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  };
+  writeJsonAtomic(ledgerFileB2, legacyLedger);
+  recordRoleSession(REPO_DIR, {
+    workflowId: "wf-leg-2",
+    role: "reviewer",
+    engine: "codex",
+    sessionId: "sess-b2-legacy",
+    isWriteRun: false
+  });
+  assert.equal(lookupSessionById(REPO_DIR, { engine: "codex", sessionId: "sess-b2-legacy" })?.hadWorktree, true);
+
+  recordRoleSession(REPO_DIR, {
+    workflowId: "wf-fork-canon",
+    role: "role-a",
+    engine: "codex",
+    sessionId: "sess-fork-canon",
+    worktreeId: "wt-f1",
+    worktreePath: null,
+    baseSha: r1Turn1.baseSha,
+    patchPath: r1Turn1.patchPath,
+    patchSha256: r1Turn1.patchSha256,
+    deliverableMode: "patch",
+    isWriteRun: true
+  });
+  recordRoleSession(REPO_DIR, {
+    workflowId: "wf-fork-canon-other",
+    role: "role-b",
+    engine: "codex",
+    sessionId: "sess-fork-canon",
+    worktreeId: "wt-f2",
+    worktreePath: null,
+    baseSha: r1Turn2.baseSha,
+    patchPath: r1Turn2.patchPath,
+    patchSha256: r1Turn2.patchSha256,
+    deliverableMode: "patch",
+    isWriteRun: true
+  });
+  recordRoleSession(REPO_DIR, {
+    workflowId: "wf-cap-inc",
+    role: "impl",
+    engine: "codex",
+    sessionId: "sess-cap-inc",
+    worktreeId: "wt-inc",
+    worktreePath: null,
+    baseSha: r1Turn1.baseSha,
+    patchPath: null,
+    deliverableMode: "none",
+    captureComplete: false,
+    isWriteRun: true
+  });
+  await assert.rejects(
+    () =>
+      runSingleTask(REPO_DIR, {
+        engine: "codex",
+        mode: "write",
+        workflowId: "wf-cap-inc",
+        role: "impl",
+        resumeSessionId: "sess-cap-inc",
+        ownedFiles: ["src/**"],
+        prompt: "Incomplete capture must never recreate clean checkout"
+      }),
+    /bound worktree.*unavailable/i
+  );
+
   // Fail-closed path: delete both worktree and patch -> explicit error instead of empty fresh worktree
   removeIsolatedWorktree(REPO_DIR, r1Replay.worktreePath);
   if (r1Replay.patchPath && fs.existsSync(r1Replay.patchPath)) fs.unlinkSync(r1Replay.patchPath);
@@ -906,6 +1012,23 @@ async function testReleaseGateStateConsistencySuite() {
       }),
     /bound worktree.*unavailable/i
   );
+
+  const forkCanonRes = await runSingleTask(REPO_DIR, {
+    engine: "codex",
+    mode: "write",
+    workflowId: "wf-fork-canon",
+    role: "role-a",
+    resumeRole: true,
+    forkSession: true,
+    ownedFiles: ["src/**"],
+    prompt: "Fork via role-a must see canonical role-b patch"
+  });
+  assert.equal(forkCanonRes.ok, true);
+  assert.ok(
+    fs.readFileSync(path.join(forkCanonRes.worktreePath, "src", "feature.txt"), "utf8").includes("turn2=ok"),
+    "Fork via resumeRole must replay canonical session patch"
+  );
+  removeIsolatedWorktree(REPO_DIR, forkCanonRes.worktreePath);
   delete process.env.TRIRELAY_TEST_CREATE_FEATURE;
 
   // R2 (P1 #2): Pipeline multi-stage constraint inheritance + stage-local ownedFiles isolation + decision retirement
@@ -983,6 +1106,45 @@ async function testReleaseGateStateConsistencySuite() {
     () => createHandoffPacket(REPO_DIR, { workflowId: "wf-b3", parentHandoffId: "hof-nonexistent-id", goal: "missing" }),
     /not found/i
   );
+  assert.throws(
+    () =>
+      createHandoffPacket(REPO_DIR, {
+        workflowId: "wf-b3",
+        decisionsMade: ["DUP_DEC"],
+        supersededDecisions: ["DUP_DEC"],
+        goal: "conflicting same-hop"
+      }),
+    /Conflicting same-hop/i
+  );
+  const wtRootDir = path.dirname(r1Turn1.worktreePath);
+  const wtCountBefore = fs.existsSync(wtRootDir) ? fs.readdirSync(wtRootDir).length : 0;
+  await assert.rejects(
+    () =>
+      runSingleTask(REPO_DIR, {
+        engine: "codex",
+        mode: "write",
+        workflowId: "wf-b3-leak",
+        parentHandoffId: "hof-missing-parent",
+        ownedFiles: ["src/**"],
+        prompt: "Must not leak worktree"
+      }),
+    /not found/i
+  );
+  await assert.rejects(
+    () =>
+      runSingleTask(REPO_DIR, {
+        engine: "codex",
+        mode: "write",
+        workflowId: "wf-b3-conflict",
+        handoffId: b3Parent.packet.handoffId,
+        parentHandoffId: b3Child.packet.handoffId,
+        ownedFiles: ["src/**"],
+        prompt: "Conflicting handoffId + parentHandoffId must throw"
+      }),
+    /Cannot specify both/i
+  );
+  const wtCountAfter = fs.existsSync(wtRootDir) ? fs.readdirSync(wtRootDir).length : 0;
+  assert.equal(wtCountAfter, wtCountBefore, "Pre-flight handoff validation errors must NOT leak worktree directories");
   const b3Md1 = renderHandoffMarkdown(b3Parent.packet);
   const b3Md2 = renderHandoffMarkdown(
     createHandoffPacket(REPO_DIR, {
@@ -1055,11 +1217,14 @@ async function testReleaseGateStateConsistencySuite() {
   }
   assert.equal(grandAlive, false, `Expected -pid SIGKILL to terminate SIGTERM-ignoring grandchild pid=${grandPid}`);
 
-  // B6 normal-exit orphan drain: CLI exits 0 cleanly while pipe-holder stays alive -> drains & settles with code=0
+  // B6 normal-exit orphan drain with two descendants (pipe holder dies on SIGTERM + stdio-redirected SIGTERM-ignoring sibling -> sibling dies via SIGKILL before settle)
   const drainT0 = Date.now();
+  const drainSibPidFile = path.join(TMP_BASE, "b6-drain-sib.pid");
   const drainScript =
-    "const { spawn } = require('node:child_process'); " +
+    "const fs = require('node:fs'); const { spawn } = require('node:child_process'); " +
     "spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: ['ignore', 1, 2] }); " +
+    `const sib = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: 'ignore' }); ` +
+    `fs.writeFileSync(${JSON.stringify(drainSibPidFile)}, String(sib.pid)); ` +
     "process.exit(0);";
   const drainRes = await spawnJsonlProcess({
     bin: process.execPath,
@@ -1073,6 +1238,14 @@ async function testReleaseGateStateConsistencySuite() {
   assert.equal(drainRes.code, 0);
   assert.equal(drainRes.timedOut, false);
   assert.ok(Date.now() - drainT0 < 3000, "Normal exit with orphaned pipe-holder must settle within drain grace");
+  const sibPid = Number(fs.readFileSync(drainSibPidFile, "utf8").trim());
+  let sibAlive = true;
+  try {
+    process.kill(sibPid, 0);
+  } catch (e) {
+    if (e.code === "ESRCH") sibAlive = false;
+  }
+  assert.equal(sibAlive, false, `Expected drain sweep SIGKILL to terminate redirected sibling pid=${sibPid}`);
 
   // R5 (P2 #5): Long 520B pin preserved intact; pin at #1 survives 205 updates; pinsOnly/seqs/supersedes work cleanly
   const r5BoardId = `pins-r5-${Date.now()}`;
@@ -1123,6 +1296,47 @@ async function testReleaseGateStateConsistencySuite() {
   assert.equal(readActiveBoardPins(REPO_DIR, r5BoardId).length, 1, "Log tail delta must reconcile out-of-date .pins.json");
   fs.writeFileSync(r5PinsFile, "{corrupt json", "utf8");
   assert.equal(readActiveBoardPins(REPO_DIR, r5BoardId).length, 1, "Corrupt .pins.json must rebuild from .jsonl");
+
+  // Round 2 B7: Torn unterminated JSONL fragment repaired on post; ordinary [update] advances watermark without rebuild; same-size replaced log triggers rebuild
+  const b7Board = `torn-b7-${Date.now()}`;
+  const b7BoardFile = resolveBoardFile(REPO_DIR, b7Board);
+  const b7PinsFile = resolveBoardPinsFile(REPO_DIR, b7Board);
+  postBoardMessage(REPO_DIR, b7Board, { author: "arch", tag: "[decision]", pinId: "b7-p1", text: "FIRST_PIN" });
+  postBoardMessage(REPO_DIR, b7Board, { author: "worker", tag: "[update]", text: "ORDINARY_UPDATE" });
+  const pinsMetaAfterUpdate = JSON.parse(fs.readFileSync(b7PinsFile, "utf8"));
+  assert.equal(pinsMetaAfterUpdate.logSize, fs.statSync(b7BoardFile).size, "Ordinary [update] must advance .pins.json logSize watermark");
+  fs.appendFileSync(b7BoardFile, '{"seq":99,"broken":', "utf8");
+  postBoardMessage(REPO_DIR, b7Board, { author: "arch", tag: "[decision]", pinId: "b7-p2", text: "SURVIVING_PIN" });
+  const b7Active = readActiveBoardPins(REPO_DIR, b7Board);
+  assert.equal(b7Active.length, 2);
+  assert.ok(b7Active.some((p) => p.text === "SURVIVING_PIN"), "Torn JSONL tail must be repaired before appending next pin");
+  // Replace last byte inside tailHash window preserving exact byte length -> headHash/tailHash catches tampering
+  const origBuf = fs.readFileSync(b7BoardFile);
+  const sameLenBuf = Buffer.from(origBuf);
+  const idxSurv = sameLenBuf.indexOf("SURVIVING_PIN");
+  sameLenBuf[idxSurv] = "X".charCodeAt(0);
+  fs.writeFileSync(b7BoardFile, sameLenBuf);
+  assert.ok(readActiveBoardPins(REPO_DIR, b7Board).some((p) => p.text === "XURVIVING_PIN"), "Same-size tail mutation must invalidate cache via tailHash");
+
+  // Round 2 B5: Concurrent maxRounds=1 returns in_progress (never premature escalate_to_user); review artifact write-once throws on overwrite & persists decision; timeoutMs forwarded
+  const concGate = `cycle-conc-${Date.now()}`;
+  process.env.TRIRELAY_TEST_REVIEW_BLOCKING = "1";
+  process.env.TRIRELAY_TEST_DELAY_MS = "800";
+  const slowR1 = runReviewGate(REPO_DIR, { gateKey: concGate, engine: "claude", maxRounds: 1 });
+  await new Promise((r) => setTimeout(r, 120));
+  const secondInFlight = await runReviewGate(REPO_DIR, { gateKey: concGate, engine: "claude", maxRounds: 1 });
+  assert.equal(secondInFlight.decision, "in_progress", "Concurrent round 2 during pending round 1 must report in_progress instead of false escalate");
+  const firstDone = await slowR1;
+  delete process.env.TRIRELAY_TEST_REVIEW_BLOCKING;
+  delete process.env.TRIRELAY_TEST_DELAY_MS;
+  assert.equal(firstDone.decision, "fix_required");
+  assert.equal(inspectReviewArtifact(REPO_DIR, { reviewId: firstDone.reviewId }).decision, "fix_required");
+  assert.throws(() => saveReviewArtifact(REPO_DIR, firstDone.reviewId, { overwrite: true }), /already exists/i);
+
+  process.env.TRIRELAY_TEST_DELAY_MS = "1500";
+  const gateTimeout = await runReviewGate(REPO_DIR, { gateKey: `gate-to-${Date.now()}`, engine: "claude", timeoutMs: 120 });
+  delete process.env.TRIRELAY_TEST_DELAY_MS;
+  assert.equal(gateTimeout.decision, "incomplete", "review-gate timeoutMs must propagate to review workers");
 
   // B5: Stale late review-gate completion cannot reopen passed cycle or corrupt newer cycle; incomplete does not consume round
   fs.writeFileSync(path.join(REPO_DIR, "src", "auth.js"), "export function login() { return true; }\n");
@@ -1196,11 +1410,29 @@ async function testReleaseGateStateConsistencySuite() {
     const capIgnScope = captureWorktreeChanges(REPO_DIR, wtIgnScope.worktreePath, wtIgnScope.worktreeId, wtIgnScope.baseSha);
     assert.equal(capIgnScope.deliverableMode, "patch");
     assert.equal(auditFileScope(capIgnScope.changedFiles, { ownedFiles: ["src/**"], forbiddenFiles: ["docs/handoff.md"] }).length, 0);
-    assert.equal(auditFileScope(capIgnScope.ignoredFiles, { ownedFiles: [], forbiddenFiles: ["docs/handoff.md"] }).length, 0);
+    assert.equal(auditFileScope(capIgnScope.allIgnoredFiles, { ownedFiles: [], forbiddenFiles: ["docs/handoff.md"] }).length, 0);
   } finally {
     removeIsolatedWorktree(REPO_DIR, wtIgnScope.worktreePath);
   }
   removeIsolatedWorktree(REPO_DIR, ignRes.worktreePath);
+
+  // Round 2 R7: >50 ignored files with forbidden ignored file at index >=52 MUST still be caught in audit while preview stays capped at 50
+  const wtIgn55 = createIsolatedWorktree(REPO_DIR, { id: `wt-ign55-${Date.now()}` });
+  try {
+    fs.writeFileSync(path.join(wtIgn55.worktreePath, ".gitignore"), "dist-ignored/\nzz-secret.ignored\n");
+    fs.mkdirSync(path.join(wtIgn55.worktreePath, "dist-ignored"), { recursive: true });
+    for (let i = 0; i < 55; i += 1) {
+      fs.writeFileSync(path.join(wtIgn55.worktreePath, "dist-ignored", `f-${String(i).padStart(3, "0")}.bin`), "x");
+    }
+    fs.writeFileSync(path.join(wtIgn55.worktreePath, "zz-secret.ignored"), "secret");
+    const cap55 = captureWorktreeChanges(REPO_DIR, wtIgn55.worktreePath, wtIgn55.worktreeId, wtIgn55.baseSha);
+    assert.equal(cap55.ignoredFiles.length, 50);
+    assert.ok(cap55.ignoredFilesTotal >= 56);
+    const v55 = auditFileScope(cap55.allIgnoredFiles, { ownedFiles: [], forbiddenFiles: ["zz-secret.ignored"] });
+    assert.equal(v55.length, 1, "Forbidden ignored path past index 50 must still be caught");
+  } finally {
+    removeIsolatedWorktree(REPO_DIR, wtIgn55.worktreePath);
+  }
 
   // R3 (P1 #3) over real MCP server: 12 blocking findings (>32 KB) compact to <=8500B with actionable reviewId,
   // blockingCount, blockingPreview, and paginated side-effect-free `inspect` (does NOT bump gate round!).
@@ -1332,6 +1564,35 @@ async function testReleaseGateStateConsistencySuite() {
     assert.equal(escTight.reviewId, round2.reviewId);
     assert.ok(Array.isArray(escTight.blockingPreview) && escTight.blockingPreview.length > 0);
 
+    // Round 2 B4: Background `relay_jobs(result)` wrapper around oversized escalation preserves reviewId, decision, blockingCount, blockingPreview
+    const bgEscCompacted = JSON.parse(serializeMcpPayload("relay_jobs", {
+      job: {
+        id: "job-bg-esc",
+        status: "failed",
+        result: {
+          ok: false,
+          reviewId: round2.reviewId,
+          decision: "escalate_to_user",
+          blockingCount: 12,
+          totalFindings: 12,
+          remainingBlockingFindings: Array.from({ length: 12 }, (_, idx) => ({
+            id: `F${idx + 1}`,
+            severity: "blocking",
+            file: `src/f${idx}.js`,
+            line_start: 10 + idx,
+            title: `BgBlocker ${idx + 1}`,
+            trigger_path: `Path ${idx + 1}`,
+            body: "Detailed background gate escalation body ".repeat(60)
+          }))
+        }
+      },
+      logTail: "noise"
+    }, { maxBytes: 4000 }).text);
+    assert.equal(bgEscCompacted.reviewId, round2.reviewId);
+    assert.equal(bgEscCompacted.decision, "escalate_to_user");
+    assert.equal(bgEscCompacted.blockingCount, 12);
+    assert.ok(Array.isArray(bgEscCompacted.blockingPreview) && bgEscCompacted.blockingPreview.length > 0);
+
     // Check full board view bypasses 100-post window
     send({
       jsonrpc: "2.0",
@@ -1345,6 +1606,86 @@ async function testReleaseGateStateConsistencySuite() {
     delete process.env.TRIRELAY_TEST_MANY_FINDINGS;
     child.stdin.end();
     child.kill("SIGTERM");
+  }
+
+  // Round 2 B6: MCP SIGTERM shutdown awaits cancelAllActiveInProcessJobs (kills SIGTERM-ignoring worker grandchildren & sets job status="cancelled")
+  const mcpKillPidFile = path.join(TMP_BASE, "mcp-kill-sib.pid");
+  const mcpFakeClaude = path.join(TMP_BASE, "fake-claude-ign");
+  fs.writeFileSync(
+    mcpFakeClaude,
+    [
+      "#!/usr/bin/env node",
+      "const fs = require('node:fs');",
+      "const { spawn } = require('node:child_process');",
+      `const c = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: 'ignore' });`,
+      `fs.writeFileSync(${JSON.stringify(mcpKillPidFile)}, String(c.pid));`,
+      "process.on('SIGTERM', () => {});",
+      "setInterval(() => {}, 1000);"
+    ].join("\n"),
+    { mode: 0o755 }
+  );
+  const prevClaudeBin = process.env.TRIRELAY_CLAUDE_BIN;
+  process.env.TRIRELAY_CLAUDE_BIN = mcpFakeClaude;
+  const mcpShut = spawn(process.execPath, [path.join(PACKAGE_ROOT, "bin", "trirelay-mcp.mjs")], {
+    cwd: REPO_DIR,
+    env: process.env,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  let shutBuf = "";
+  const shutMap = new Map();
+  mcpShut.stdout.setEncoding("utf8");
+  mcpShut.stdout.on("data", (c) => {
+    shutBuf += c;
+    let idx = shutBuf.indexOf("\n");
+    while (idx !== -1) {
+      const l = shutBuf.slice(0, idx).trim();
+      shutBuf = shutBuf.slice(idx + 1);
+      if (l) {
+        const m = JSON.parse(l);
+        if (m.id !== undefined) shutMap.set(m.id, m);
+      }
+      idx = shutBuf.indexOf("\n");
+    }
+  });
+  const waitShut = async (id) => {
+    const t0 = Date.now();
+    while (!shutMap.has(id)) {
+      if (Date.now() - t0 > 10000) throw new Error(`MCP shutdown test timeout id=${id}`);
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    return shutMap.get(id);
+  };
+  let bgJobId = null;
+  try {
+    mcpShut.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } })}\n`);
+    await waitShut(1);
+    mcpShut.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "relay_run", arguments: { cwd: REPO_DIR, host: "agy", engine: "claude", background: true, prompt: "hang forever" } }
+    })}\n`);
+    bgJobId = JSON.parse((await waitShut(2)).result.content[0].text).jobId;
+    const waitPidT0 = Date.now();
+    while (!fs.existsSync(mcpKillPidFile) && Date.now() - waitPidT0 < 5000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(fs.existsSync(mcpKillPidFile), "Background MCP worker must have spawned grandchild");
+    const mcpExitPromise = new Promise((r) => mcpShut.once("exit", (code) => r(code)));
+    mcpShut.kill("SIGTERM");
+    await mcpExitPromise;
+    const mcpSibPid = Number(fs.readFileSync(mcpKillPidFile, "utf8").trim());
+    let mcpSibAlive = true;
+    try {
+      process.kill(mcpSibPid, 0);
+    } catch (e) {
+      if (e.code === "ESRCH") mcpSibAlive = false;
+    }
+    assert.equal(mcpSibAlive, false, `MCP SIGTERM shutdown must SIGKILL grandchild pid=${mcpSibPid} before exiting`);
+    assert.equal(readJobDetail(REPO_DIR, bgJobId, { exact: true })?.status, "cancelled");
+  } finally {
+    if (prevClaudeBin) process.env.TRIRELAY_CLAUDE_BIN = prevClaudeBin;
+    try { mcpShut.kill("SIGKILL"); } catch {}
   }
 
   console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables)");
