@@ -1,7 +1,7 @@
 {
   "name": "trirelay",
-  "version": "1.0.0",
-  "description": "Host-symmetric multi-agent orchestration relay connecting Antigravity (agy), Claude Code (claude), and OpenAI Codex (codex) with zero-dep async MCP, sub-50ms SessionStart snapshots, 3-tier memory, and isolated git worktrees.",
+  "version": "1.1.0",
+  "description": "Host-symmetric multi-agent orchestration relay connecting Antigravity (agy), Claude Code (claude), and OpenAI Codex (codex) with zero-dep async MCP, bounded SessionStart snapshots, 3-tier memory, and isolated git worktrees.",
   "type": "module",
   "license": "MIT",
   "repository": {

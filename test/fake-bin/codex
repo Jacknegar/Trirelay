@@ -51,6 +51,28 @@ if (process.env.TRIRELAY_TEST_CODEX_COMMIT === "1") {
   fs.writeFileSync(path.join(process.cwd(), "committed file.txt"), "hello committed\n");
 }
 
+if (process.env.TRIRELAY_TEST_IGNORED_ONLY === "1") {
+  fs.mkdirSync(path.join(process.cwd(), "dist-ignored"), { recursive: true });
+  fs.writeFileSync(path.join(process.cwd(), "dist-ignored", "out.bin"), "ignored-artifact\n");
+  outText = "CREATED_IGNORED_ONLY";
+}
+
+if (process.env.TRIRELAY_TEST_CREATE_FEATURE === "1") {
+  const featPath = path.join(process.cwd(), "src", "feature.txt");
+  const isResume = args.includes("resume") || args.includes("fork");
+  if (!isResume) {
+    fs.mkdirSync(path.dirname(featPath), { recursive: true });
+    fs.writeFileSync(featPath, "turn1=ok\n");
+    outText = `TURN1_CREATED cwd=${process.cwd()}`;
+  } else {
+    const hasFeature = fs.existsSync(featPath);
+    if (hasFeature) {
+      fs.appendFileSync(featPath, "turn2=ok\n");
+    }
+    outText = `TURN2_RESUME hasFeature=${hasFeature} cwd=${process.cwd()}`;
+  }
+}
+
 console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-thr-test-1" }));
 console.log(JSON.stringify({ type: "turn.started" }));
 console.log(JSON.stringify({ type: "item.completed", item: { id: "item_1", type: "agent_message", text: outText } }));

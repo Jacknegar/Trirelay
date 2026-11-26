@@ -16,6 +16,15 @@ import {
 } from "./state.mjs";
 
 const activeInProcessJobs = new Map();
+const activeForegroundOps = new Set();
+
+export function registerActiveAbortController(controller, promise) {
+  const entry = { controller, promise };
+  activeForegroundOps.add(entry);
+  const cleanup = () => activeForegroundOps.delete(entry);
+  promise.then(cleanup, cleanup);
+  return entry;
+}
 
 function resolveJobCancelFile(cwd, jobId) {
   const safeId = validateOpaqueId(jobId, "jobId");
@@ -75,6 +84,17 @@ export function launchBackgroundJob(cwd, meta, asyncRunner) {
         sessionId: result?.sessionId ?? null,
         worktreePath: result?.worktreePath ?? null,
         patchPath: result?.patchPath ?? null,
+        patchSha256: result?.patchSha256 ?? null,
+        deliverableMode: result?.deliverableMode ?? null,
+        ignoredOnlyDeliverables: Boolean(result?.ignoredOnlyDeliverables),
+        ignoredFiles: result?.ignoredFiles ?? [],
+        ownedFiles: result?.ownedFiles ?? [],
+        forbiddenFiles: result?.forbiddenFiles ?? [],
+        reviewId: result?.reviewId ?? null,
+        decision: result?.decision ?? null,
+        verdict: result?.verdict ?? null,
+        blockingCount: result?.blockingCount ?? null,
+        totalFindings: result?.totalFindings ?? null,
         finalHeadSha: result?.finalHeadSha ?? null,
         changedFiles: result?.changedFiles ?? [],
         scopeViolations: result?.scopeViolations ?? [],
@@ -170,7 +190,18 @@ export async function handleJobControl(cwd, args = {}) {
     const waitMs = Math.max(500, Math.min(90000, Number(args.waitTimeoutMs ?? 30000)));
     const active = activeInProcessJobs.get(args.jobId);
     if (active) {
-      await Promise.race([active.promise, new Promise((r) => setTimeout(r, waitMs))]);
+      let waitTimer = null;
+      try {
+        await Promise.race([
+          active.promise,
+          new Promise((r) => {
+            waitTimer = setTimeout(r, waitMs);
+            waitTimer.unref?.();
+          })
+        ]);
+      } finally {
+        if (waitTimer) clearTimeout(waitTimer);
+      }
     } else {
       const deadline = Date.now() + waitMs;
       while (Date.now() < deadline) {
@@ -181,7 +212,7 @@ export async function handleJobControl(cwd, args = {}) {
     }
   }
 
-  const detail = readJobDetail(workspaceRoot, args.jobId);
+  const detail = readJobDetail(workspaceRoot, args.jobId, { exact: Boolean(args.exact) });
   if (!detail) {
     throw new Error(`Job "${args.jobId}" not found.`);
   }
@@ -193,4 +224,24 @@ export async function handleJobControl(cwd, args = {}) {
   }
 
   return { job: detail, logTail };
+}
+
+export async function cancelAllActiveInProcessJobs(graceMs = 2500) {
+  const deadline = Date.now() + Math.max(100, Number(graceMs) || 2500);
+  while (Date.now() < deadline) {
+    const allActive = [...activeInProcessJobs.values(), ...activeForegroundOps.values()];
+    if (allActive.length === 0) break;
+    for (const item of allActive) {
+      try {
+        item.controller.abort();
+      } catch {
+        // Ignore abort errors.
+      }
+    }
+    const remaining = Math.max(20, deadline - Date.now());
+    await Promise.race([
+      Promise.allSettled(allActive.map((a) => a.promise)),
+      new Promise((r) => setTimeout(r, Math.min(250, remaining)))
+    ]);
+  }
 }

@@ -1,7 +1,7 @@
 {
   "name": "trirelay",
   "displayName": "Trirelay (Antigravity × Claude Code × Codex)",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "logo": "assets/logo.svg",
   "description": "Host-symmetric multi-agent relay connecting Antigravity, Claude Code, and OpenAI Codex with async bounded MCP, 3-tier continuity memory, MCP-isolated fast workers, and isolated git worktrees.",
   "author": {

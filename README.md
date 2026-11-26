@@ -17,11 +17,11 @@ English · [简体中文](README.zh-CN.md) · [Quick Start](#quick-start) · [Be
 
 <br />
 
-**Trirelay** (`trirelay`) is a zero-dependency local MCP server, CLI, and shared Skill bundle that connects **Google Antigravity (`agy`)**, **Claude Code (`claude`)**, and **OpenAI Codex (`codex`)** symmetrically. Whichever agent hosts your session acts as coordinator and safely dispatches, isolates, reviews, and hands off work to the other two—without losing pinned decisions, spilling MCP outputs to disk, or triggering recursive CLI loops.
+**Trirelay** (`trirelay`) is a zero-dependency local MCP server, CLI, and shared Skill bundle that connects **Google Antigravity (`agy`)**, **Claude Code (`claude`)**, and **OpenAI Codex (`codex`)** symmetrically. Whichever agent hosts your session acts as coordinator for **trackable, resumable, and verifiable multi-turn cross-agent handoffs**—isolating write edits in worktrees, inheriting explicit constraints across stages, bounding MCP payloads, and blocking recursive CLI loops.
 
-| Tiered Board Memory | Cross-Engine Recall & Cache | MCP Inline Payload Cap | SessionStart Continuity |
+| Tiered Board Memory *(v1.1.0 offline)* | Cross-Engine Continuity *(v1.1.0 offline)* | MCP Inline Payload Cap *(v1.1.0 offline)* | SessionStart Hook *(v1.1.0 offline)* |
 | :---: | :---: | :---: | :---: |
-| **-50.3%**<br><sub>`6,405 B → 3,182 B` · `5/5` pins intact</sub> | **5 / 5 intact**<br><sub>`codex → claude → agy` + `73.8%` cached input</sub> | **0 spills (-96.5%)**<br><sub>`28,203 B → 992 B` · `≤8.5 KB` cap</sub> | **526 ms** *(464 B)*<br><sub>Git + roles + handoff + board stubs</sub> |
+| **-48.4%**<br><sub>`6,405 B → 3,305 B` · `5/5` pins intact</sub> | **100% prefix + chain**<br><sub>`373 B` byte-0 prefix · cross-stage invariants intact</sub> | **-96.4% / -98.5%**<br><sub>`1,018 B` job / `917 B` review (`≤8.8 KB` threshold + `blockingPreview`)</sub> | **623 ms median** *(462 B)*<br><sub>Git + roles + handoff + pins/stubs</sub> |
 
 ---
 
@@ -35,13 +35,14 @@ Most multi-agent bridges either lock one tool in as permanent boss, bloat prompt
    - From **OpenAI Codex**: delegates to `agy` & `claude`
    Role routing (`advisor`, `implementer`, `reviewer`) excludes the active host automatically, strips nested host env vars (`CLAUDECODE`, `ANTIGRAVITY_*`, etc.), and enforces `TRIRELAY_DEPTH` recursion guards.
 2. **Elephant vs. Goldfish Context Routing**
-   - **Elephant (Shared Continuity)**: Implementation & multi-turn roles receive **Prefix-Cache-ordered** `<HANDOFF_PACKET>` files, **3-tier board views** (*Pin → 120-char programmatic Stub → On-Demand Recall*, zero extra LLM summary calls), and `resumeRole: true` incremental deltas.
-   - **Goldfish (Zero-Context Audit)**: `relay_review`, `relay_review_gate`, and `relay_design(action="start")` run with **0 prior chat history** and **no author defense**—eliminating anchoring bias while slashing input tokens.
-3. **Production Guardrails (Not Just Prompts)**
-   - **Mandatory Isolated Worktrees (`mode: "write"`)**: Every write worker edits inside an isolated `git worktree`, captures uncommitted edits, untracked files, AND detached-HEAD commits into binary `.patch` files, audits `ownedFiles`/`forbiddenFiles` (including `--no-renames` source+target paths), and never touches your main checkout until you run `relay_apply(mode="apply")`.
+   - **Elephant (Trackable Continuity)**: Implementation & multi-turn roles receive **byte-0 prefix-stable** `<HANDOFF_PACKET>` files (`<HANDOFF_CONTRACT>` + pinned invariants before the turn delimiter), **3-tier board views** (*dedicated `.pins.json` active-pin index → 120-char programmatic Stub → explicit omission warnings + paginated/full recall*, zero extra LLM summary calls), chained constraint inheritance (`invariants`, `decisionsMade`, `doNotRelitigate`, `forbiddenFiles`) across pipeline stages, and worktree-bound `resumeRole: true` sessions.
+   - **Goldfish (Zero-Context Audit)**: `relay_review`, `relay_review_gate`, and `relay_design(action="start")` run with **0 prior chat history** and **no author defense**—eliminating anchoring bias while cutting input tokens.
+3. **Process & Scope Guardrails**
+   - **Worktree-Isolated Writes (`mode: "write"`) + Resumable Snapshots**: Write workers run inside isolated `git worktree` checkouts, capture uncommitted edits, untracked files, binary diffs, and detached-HEAD commits into per-job `.patch` artifacts with SHA-256 hashes (reporting `deliverableMode: "patch" | "ignored-only" | "none"`), audit `ownedFiles`/`forbiddenFiles` (`--no-renames` source+target, re-audited on `relay_apply`), and hold edits out of your main tree until `relay_apply(mode="apply")`. Resuming a write session (`resumeRole: true`) rebinds the original worktree (or replays its SHA-256-verified `.patch` onto `baseSha`) and fails closed if unrecoverable.
+   - **Per-Engine Execution Profiles**: Drivers enforce distinct engine tool rules—`claude` in `mode: "write"` restricts allowed tools and disables `Bash` (`--disallowedTools Bash`), so it edits files directly without running shell commands/tests; `codex` runs with `workspace-write` sandbox isolation; `agy` runs with `--mode accept-edits` (no `--sandbox`) in write mode and `--mode plan --sandbox` in readonly mode.
+   - **Write-Once Review Artifacts & Bounded Cycle Gate (`relay_review` / `relay_review_gate`)**: Dual-engine reviews persist full findings as write-once `reviewId` artifacts with zero-cost paginated inspection (`action: "inspect"`), preserve `blockingPreview[]` (`id`, `file`, `line`, `title`, `trigger`) under the `8.5 KB` inline MCP cap, separate `blocking` defects from `advisory` notes, upgrade sensitive paths (`auth`, `billing`, `credentials`, `deploy`, `persistence`, `eval`) to `xhigh`, and manage cycle lifecycles cleanly (`open` -> `passed` -> new cycle) with `cycleId` compare-and-set and escalation on round 3+.
    - **Sealed Dual-Track Design (`relay_design`)**: Keeps the host draft hashed & sealed until the independent advisor finishes, then reveals both with a 4-section merge template.
-   - **Bounded 2-Round Review Gate (`relay_review_gate`)**: Separates `blocking` defects (requiring a concrete `trigger_path`) from `advisory` notes, auto-upgrades sensitive paths (`auth`, `billing`, `credentials`, `deploy`, `persistence`, `eval`) to `xhigh`, and escalates on round 3+.
-   - **Spill-Free Bounded Async MCP**: `background: true` + `relay_jobs` prevents 3-minute MCP RPC timeouts; responses over `8.5 KB` are deterministically compacted with explicit `_recall` IDs.
+   - **Spill-Free Bounded Async MCP**: `background: true` + `relay_jobs` avoids 3-minute MCP RPC timeouts; responses over `8.5 KB` compact deterministically with actionable `_recall` pointers (and `allowUnboundedRecall` for explicit `inspect`/`pinsOnly`/`seqs`/`view="full"` requests).
 
 ---
 
@@ -106,7 +107,7 @@ For **Claude Code 2.1.275+** marketplace installs:
 
 ## MCP & CLI Reference
 
-Every MCP tool has 1:1 CLI parity (`./bin/trirelay.mjs <subcommand>`):
+Every core workflow has matching CLI commands (`./bin/trirelay.mjs <subcommand>`, including `--parent-handoff`, `--decision`, `--do-not-relitigate`, `--supersede`, `--deprecate-invariant`, and `--timeout`), while fine-grained JSON schema options live on the MCP surface:
 
 | MCP Tool | CLI Equivalent | Purpose |
 |---|---|---|
@@ -136,30 +137,38 @@ Every MCP tool has 1:1 CLI parity (`./bin/trirelay.mjs <subcommand>`):
 
 ## Benchmarks
 
-All metrics below were measured locally using [`scripts/benchmark.mjs`](scripts/benchmark.mjs) on **Linux x64 (`Node.js v24.15.0`)** with **`claude 2.1.325`**, **`codex-cli 0.169.1`**, and **`agy 1.5.18`**:
+Offline metrics (`v1.1.0`) were generated locally using `npm run benchmark` (`scripts/benchmark.mjs`, `Node.js v24.15.0`); payload byte checks are deterministic, while hook latencies reflect wall-clock spawns. Historical live rows below are **single-run `v1.0.0` observations** recorded locally on Linux x64 (`Node.js v24.15.0`, `claude 2.1.325`, `codex-cli 0.169.1`, `agy 1.5.18`) and are not continuously re-run in CI:
 
 ```bash
-# Deterministic offline check (~1s, safe for CI)
+# Deterministic byte + local hook offline check (~1s, safe for CI)
 npm run benchmark
 
 # Live multi-engine benchmark inside a disposable /tmp repo
 node ./scripts/benchmark.mjs --live
 ```
 
-### Measured Results
+### Offline Component Checks (`v1.1.0`)
 
-| Task / Comparison | Baseline (Naive) | Trirelay | Measured Outcome |
+| Check | Baseline (Naive) | Trirelay (`v1.1.0`) | Measured Outcome |
 |---|---|---|---|
-| **12-Post Cross-Engine Board** *(offline)* | `6,405 B` full dump | `3,182 B` (Pin + Stub) | **`-50.3%` bytes**, **`5/5` pinned `INV_*` intact** |
-| **MCP Inline Cap vs Disk Spill** *(offline)* | `28,203 B` (`>8.8 KB` spill) | `992 B` (`_compacted` + `_recall`) | **`-96.5%` bytes**, **`0` spills** |
-| **Prefix-Cache Header Stability** *(offline)* | Dynamic ordering | `488 B` static prefix first | **100% byte-identical across turns** |
-| **SessionStart Continuity Hook** *(offline, 3 runs)* | Manual cold inspection | `598 / 496 / 526 ms` | **`526 ms` median**, **`464 B`** payload |
-| **3-Hop Memory Relay** *(`codex → claude → agy`, live)* | Ad-hoc prompt copy | `<HANDOFF_PACKET>` + tiered board | **Codex `5/5`** (31.1 s), **Claude `5/5`** (8.5 s), **Agy `5/5`** (101.0 s) |
-| **Codex `resumeRole` Turn 2 Delta** *(live)* | Full re-prompt (`46k+` uncached) | `58 B` delta prompt | **`5/5` recalled**, same session, **`73.8%` (`34,432 / 46,651`) cached input tokens** (`39.5 s`) |
-| **Parallel Dual-Engine Review** *(`claude + codex`, live)* | `103,598 ms` serial sum | `93,817 ms` parallel wall-clock | **`-9.4%` wall time** (`claude` 11.2 s + `codex` 92.4 s; both flagged seeded bug: 4 findings) |
-| **Isolated Worktree Write + Check** *(`claude`, live)* | Direct working-tree mutation | Detached `git worktree` + `.patch` | **`ok: true` (`11.7 s`)**, `0` scope violations, main tree untouched, `apply --check` passed |
+| **12-Post Cross-Engine Board** | `6,405 B` full dump | `3,305 B` (Active Pins + Stubs + recall hint) | **`-48.4%` bytes**, **`5/5` pinned `INV_*` intact** |
+| **MCP Job Inline Cap** | `28,233 B` (`>8.8 KB` threshold) | `1,018 B` (`_compacted` + `_recall`) | **`-96.4%` bytes**, stays below `8.8 KB` host threshold |
+| **MCP Review Inline Cap** *(12 findings)* | `59,428 B` (`>8.8 KB` threshold) | `917 B` (`blockingPreview=5` + `inspect` `_recall`) | **`-98.5%` bytes**, below `8.8 KB` threshold with preview |
+| **Byte-0 Prefix & Multi-Hop Chain** | Dynamic / different `ownedFiles` | `373 B` byte-0 static header + chained handoff | **100% byte-0 identical across stages**, **`chainedInheritanceIntact: true`** |
+| **SessionStart Continuity Hook** *(3 runs)* | Manual cold inspection | `623 / 693 / 564 ms` | **`623 ms` median**, **`462 B`** payload |
 
-> **Honest Note on Codex Cold-Start Variance**: Disabling user `[mcp_servers.*]` protects Codex workers from hanging on unauthenticated OAuth MCP endpoints and prevents recursive MCP loops. However, across two noisy live network runs (`gpt-6-luna@low` via remote proxy), raw cold-start wall time was still dominated by API proxy variance and Codex `[plugins.*]` (`naive`: `16.4 s / 40.5 s`, median `28.4 s`; `isolated`: `75.0 s / 56.2 s`, median `65.6 s`). Trirelay's speed advantages come primarily from **parallel fan-out**, **`resumeRole` delta sessions**, **prefix-cache ordering**, **zero-spill bounded outputs**, and **fast non-Codex routing (`claude` ~8.5–11.7 s)**—not magical elimination of network variance.
+> Note: "stays below `8.8 KB` threshold" verifies compacted serialized payload size locally rather than measuring a live host UI disk spill.
+
+### Prior Live Single-Run Observations (`v1.0.0` reference)
+
+| Task / Comparison | Baseline | Trirelay | Observed Outcome (`v1.0.0`, single run) |
+|---|---|---|---|
+| **3-Hop Memory Relay** *(`codex → claude → agy`)* | Ad-hoc prompt copy | `<HANDOFF_PACKET>` + tiered board | **Codex `5/5`** (31.1 s), **Claude `5/5`** (8.5 s), **Agy `5/5`** (101.0 s) |
+| **Codex `resumeRole` Turn 2 Delta** | Full re-prompt | `58 B` delta prompt | **`5/5` recalled**, same session, **`73.8%` (`34,432 / 46,651`) cached input tokens** (`39.5 s`) |
+| **Parallel Dual-Engine Review** *(`claude + codex`)* | `103,598 ms` *(estimated `serialSum` of both worker durations)* | `93,817 ms` parallel wall-clock | **`claude` 11.2 s + `codex` 92.4 s** in parallel (both flagged seeded bug: 4 findings) |
+| **Isolated Worktree Write + Check** *(`claude`)* | Direct working-tree mutation | Detached `git worktree` + `.patch` | **`ok: true` (`11.7 s`)**, `0` scope violations, main tree untouched, `apply --check` passed |
+
+> **Honest Note on Live Variance & Cold-Start Cost**: Disabling user `[mcp_servers.*]` protects Codex workers from hanging on unauthenticated OAuth MCP endpoints and prevents recursive MCP loops. Across two noisy live runs (`gpt-6-luna@low` via remote proxy), raw cold-start wall time was still dominated by API proxy variance and Codex `[plugins.*]` (`naive`: `16.4 s / 40.5 s`, median `28.4 s`; `isolated`: `75.0 s / 56.2 s`, median `65.6 s`). Trirelay's latency gains come from **parallel fan-out**, **`resumeRole` delta sessions**, **byte-0 prefix ordering**, **zero-spill bounded outputs**, and **routing lightweight steps to lower-latency CLIs**—not elimination of upstream model/network variance.
 
 ---
 
@@ -167,7 +176,7 @@ node ./scripts/benchmark.mjs --live
 
 ```bash
 npm run check                                   # Syntax check across all .mjs files
-npm test                                        # 15 unit & integration suites (fake CLI + live git/MCP/locks)
+npm test                                        # 16 unit & release-gate suites (fake CLI + live git/MCP/locks)
 sh -n scripts/mcp-launcher.sh scripts/hook-launcher.sh scripts/install.sh
 ```
 
@@ -177,8 +186,8 @@ Validated against host tooling:
 
 ## Platform & Compatibility Notes
 
-- **Live-tested**: Linux x64 (`Ubuntu`, `Node v24.15.0`).
-- **Statically reviewed for macOS**: Uses POSIX `sh` launchers with symlink resolution and Homebrew/nvm/fnm/volta discovery, atomic `mkdir` cross-process locks, and CI matrix verification on `macos-latest` ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), but has not yet been executed directly on local macOS hardware.
+- **Live-tested**: Linux x64 (`Ubuntu`, tested locally on `Node v24.15.0`).
+- **CI & macOS compatibility**: GitHub Actions is configured to run syntax checks and `npm test` on `ubuntu-latest` and `macos-latest` (`Node 20`, `22`) ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). POSIX `sh` launchers and symlink/PATH discovery were statically reviewed for macOS, but have not yet been executed directly on local physical macOS hardware.
 
 ## Acknowledgements
 

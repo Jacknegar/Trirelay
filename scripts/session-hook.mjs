@@ -7,7 +7,7 @@ import process from "node:process";
 
 import { buildTieredBoardView, truncateWithByteNotice } from "../core/compact.mjs";
 import { canonicalizePath, resolveWorkspaceRoot, runSync } from "../core/env.mjs";
-import { loadSessionLedger, readBoardPosts, readJsonSafe, resolveStateDir, saveHostSession } from "../core/state.mjs";
+import { loadSessionLedger, readActiveBoardPins, readBoardPosts, readJsonSafe, resolveStateDir, saveHostSession } from "../core/state.mjs";
 
 const MAX_SNAPSHOT_BYTES = 1500;
 
@@ -102,9 +102,16 @@ export function buildContinuitySnapshot(cwd) {
 
   const latestBoardId = readLatestBoardId(path.join(stateDir, "boards"));
   if (latestBoardId) {
+    const activePins = readActiveBoardPins(workspaceRoot, latestBoardId);
     const posts = readBoardPosts(workspaceRoot, latestBoardId, { since: 0, limit: 100 });
-    if (posts.length > 0) {
-      const tiered = buildTieredBoardView(posts, { boardId: latestBoardId, recentFull: 2, maxStubChars: 90, maxBytes: 500 });
+    if (posts.length > 0 || activePins.length > 0) {
+      const tiered = buildTieredBoardView(posts, {
+        pinnedPosts: activePins,
+        boardId: latestBoardId,
+        recentFull: 2,
+        maxStubChars: 90,
+        maxBytes: 500
+      });
       const items = tiered.posts
         .slice(-3)
         .map((p) => `#${p.seq} ${sanitizeSnapshotText(p.tag, 20)} ${sanitizeSnapshotText(p.author, 24)}: ${sanitizeSnapshotText(p.summary || p.text, 80)}`);

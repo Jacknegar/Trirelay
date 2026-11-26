@@ -13,9 +13,15 @@ import {
   resolveWorkspaceRoot
 } from "../core/env.mjs";
 import { createHandoffPacket, listWorkspaceClaudeSessions, loadHandoffPacket } from "../core/handoff.mjs";
-import { handleJobControl, launchBackgroundJob } from "../core/jobs.mjs";
+import {
+  cancelAllActiveInProcessJobs,
+  handleJobControl,
+  launchBackgroundJob,
+  registerActiveAbortController
+} from "../core/jobs.mjs";
 import {
   assertRecursionSafe,
+  inspectReviewArtifact,
   runCopyReview,
   runDualDesign,
   runDualReview,
@@ -28,14 +34,17 @@ import { getFullModelCatalog, resolveRoute } from "../core/router.mjs";
 import {
   loadHostSession,
   postBoardMessage,
+  readActiveBoardPins,
   readBoardPosts,
+  readBoardPostsBySeqs,
   readJsonSafe
 } from "../core/state.mjs";
-import { applyWorktreePatch } from "../core/worktree.mjs";
+import { applyJobPatch } from "../core/worktree.mjs";
 
 const PACKAGE_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const PKG = readJsonSafe(path.join(PACKAGE_ROOT, "package.json"), { version: "1.0.0" });
 const SUPPORTED_PROTOCOL_VERSIONS = ["2025-03-26", "2024-11-05"];
+let serverShuttingDown = false;
 
 const TOOLS = [
   {
@@ -109,10 +118,15 @@ const TOOLS = [
         effort: { type: "string" },
         mode: { type: "string", enum: ["readonly", "write"], default: "readonly" },
         worktree: { type: "boolean" },
-        ownedFiles: { type: "array", items: { type: "string" } },
-        forbiddenFiles: { type: "array", items: { type: "string" } },
+        ownedFiles: { type: "array", items: { type: "string" }, description: "Allowed write path rules using strict segment globs (* matches within one segment, ** matches any segments)." },
+        forbiddenFiles: { type: "array", items: { type: "string" }, description: "Blocked path rules using gitignore-style deny semantics (slash-free patterns match any depth; matched directories block descendants)." },
         invariants: { type: "array", items: { type: "string" } },
+        decisionsMade: { type: "array", items: { type: "string" } },
+        doNotRelitigate: { type: "array", items: { type: "string" } },
+        supersededDecisions: { type: "array", items: { type: "string" } },
+        deprecatedInvariants: { type: "array", items: { type: "string" } },
         acceptanceCriteria: { type: "array", items: { type: "string" } },
+        parentHandoffId: { type: "string" },
         handoffId: { type: "string" },
         handoff: { type: "boolean" },
         includeHostDigest: { type: "boolean" },
@@ -129,11 +143,16 @@ const TOOLS = [
   {
     name: "relay_review",
     description:
-      "Run Goldfish (zero-history) adversarial code review using agy, claude, codex, or both non-host engines in parallel. Auto-upgrades to xhigh on sensitive paths.",
+      "Run Goldfish (zero-history) adversarial code review (`action='run'`) or paginate stored findings without side effects (`action='inspect'`, `reviewId`).",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
+        action: { type: "string", enum: ["run", "inspect"], default: "run" },
+        reviewId: { type: "string" },
+        offset: { type: "number", default: 0 },
+        limit: { type: "number", default: 10 },
+        severity: { type: "string" },
         cwd: { type: "string" },
         host: { type: "string", enum: ["agy", "claude", "codex", "cli"] },
         background: { type: "boolean", default: false },
@@ -146,20 +165,27 @@ const TOOLS = [
         codexModel: { type: "string" },
         claudeModel: { type: "string" },
         effort: { type: "string" },
-        native: { type: "boolean" }
+        native: { type: "boolean" },
+        timeoutMs: { type: "number" }
       }
     }
   },
   {
     name: "relay_review_gate",
     description:
-      "Bounded 2-round blocking vs advisory review gate. Escalates remaining blocking findings to user after maxRounds (default 2).",
+      "Bounded 2-round cycle-scoped blocking vs advisory review gate (`action='run'` or `action='inspect'` with `reviewId`). Escalates after maxRounds within an unpassed cycle.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
+        action: { type: "string", enum: ["run", "inspect"], default: "run" },
+        reviewId: { type: "string" },
+        offset: { type: "number", default: 0 },
+        limit: { type: "number", default: 10 },
+        severity: { type: "string" },
         cwd: { type: "string" },
         host: { type: "string", enum: ["agy", "claude", "codex", "cli"] },
+        background: { type: "boolean", default: false },
         gateKey: { type: "string" },
         workflowId: { type: "string" },
         maxRounds: { type: "number", default: 2 },
@@ -168,7 +194,8 @@ const TOOLS = [
         scope: { type: "string", enum: ["auto", "working-tree", "branch"] },
         base: { type: "string" },
         focus: { type: "string" },
-        effort: { type: "string" }
+        effort: { type: "string" },
+        timeoutMs: { type: "number" }
       }
     }
   },
@@ -242,7 +269,8 @@ const TOOLS = [
         includeHostDigest: { type: "boolean" },
         includeRepoHandoff: { type: "boolean" },
         maxConcurrency: { type: "number" },
-        maxPerEngine: { type: "number" }
+        maxPerEngine: { type: "number" },
+        timeoutMs: { type: "number" }
       }
     }
   },
@@ -272,6 +300,7 @@ const TOOLS = [
       properties: {
         action: { type: "string", enum: ["create", "inspect", "list_claude_sessions"] },
         cwd: { type: "string" },
+        parentHandoffId: { type: "string" },
         handoffId: { type: "string" },
         workflowId: { type: "string" },
         boardId: { type: "string" },
@@ -279,11 +308,13 @@ const TOOLS = [
         toEngine: { type: "string", enum: ["agy", "claude", "codex"] },
         role: { type: "string" },
         goal: { type: "string" },
-        ownedFiles: { type: "array", items: { type: "string" } },
-        forbiddenFiles: { type: "array", items: { type: "string" } },
+        ownedFiles: { type: "array", items: { type: "string" }, description: "Allowed write path rules using strict segment globs (* matches within one segment, ** matches any segments)." },
+        forbiddenFiles: { type: "array", items: { type: "string" }, description: "Blocked path rules using gitignore-style deny semantics (slash-free patterns match any depth; matched directories block descendants)." },
         invariants: { type: "array", items: { type: "string" } },
         decisionsMade: { type: "array", items: { type: "string" } },
         doNotRelitigate: { type: "array", items: { type: "string" } },
+        supersededDecisions: { type: "array", items: { type: "string" } },
+        deprecatedInvariants: { type: "array", items: { type: "string" } },
         openQuestions: { type: "array", items: { type: "string" } },
         evidence: { type: "array", items: { type: "string" } },
         acceptanceCriteria: { type: "array", items: { type: "string" } },
@@ -296,7 +327,7 @@ const TOOLS = [
   {
     name: "relay_board",
     description:
-      "Read (3-tier Pin/Stub/Recall by default, or view='full') or post messages on the shared multi-engine coordination board.",
+      "Read (3-tier Pin/Stub/Recall by default, or view='full' / pinsOnly / seqs) or post messages (supporting pinId / supersedes) on the shared board.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -306,11 +337,18 @@ const TOOLS = [
         cwd: { type: "string" },
         boardId: { type: "string", default: "default" },
         view: { type: "string", enum: ["tiered", "full"], default: "tiered" },
+        pinsOnly: { type: "boolean", default: false },
+        seqs: { type: "array", items: { type: "number" } },
         since: { type: "number", default: 0 },
-        limit: { type: "number", default: 100 },
+        limit: {
+          type: "number",
+          description: "Entry cap (defaults to 100 when view='tiered'; unbounded 0 when view='full')."
+        },
         author: { type: "string" },
         tag: { type: "string" },
-        text: { type: "string" }
+        text: { type: "string" },
+        pinId: { type: "string" },
+        supersedes: { type: "string" }
       }
     }
   },
@@ -442,13 +480,19 @@ async function handleToolCall(name, args = {}) {
             runSingleTask(cwd, args, { jobId, logFile, signal })
         );
       }
-      const res = await runSingleTask(cwd, args);
+      const controller = new AbortController();
+      const promise = runSingleTask(cwd, args, { signal: controller.signal });
+      registerActiveAbortController(controller, promise);
+      const res = await promise;
       return { isToolError: !res.ok, data: res };
     }
 
     case "relay_review": {
       assertRecursionSafe(cwd);
       validateCallerArgs(args);
+      if (args.action === "inspect" || args.reviewId) {
+        return inspectReviewArtifact(cwd, args);
+      }
       if (args.background) {
         return launchBackgroundJob(
           cwd,
@@ -456,12 +500,31 @@ async function handleToolCall(name, args = {}) {
           ({ signal }) => runDualReview(cwd, args, { signal })
         );
       }
-      const res = await runDualReview(cwd, args);
+      const controller = new AbortController();
+      const promise = runDualReview(cwd, args, { signal: controller.signal });
+      registerActiveAbortController(controller, promise);
+      const res = await promise;
       return { isToolError: !res.ok, data: res };
     }
 
-    case "relay_review_gate":
-      return await runReviewGate(cwd, args);
+    case "relay_review_gate": {
+      if (args.action === "inspect" || args.reviewId) {
+        return inspectReviewArtifact(cwd, args);
+      }
+      if (args.background && !args.reset) {
+        assertRecursionSafe(cwd);
+        validateCallerArgs(args);
+        return launchBackgroundJob(
+          cwd,
+          { kind: "review-gate", workflowId: args.gateKey || args.workflowId || "default-gate", role: "reviewer", mode: "readonly" },
+          ({ signal }) => runReviewGate(cwd, args, { signal })
+        );
+      }
+      const controller = new AbortController();
+      const promise = runReviewGate(cwd, args, { signal: controller.signal });
+      registerActiveAbortController(controller, promise);
+      return await promise;
+    }
 
     case "relay_design": {
       if (args.action === "start" && args.background) {
@@ -470,14 +533,21 @@ async function handleToolCall(name, args = {}) {
         return launchBackgroundJob(
           cwd,
           { kind: "design", workflowId: args.designId || "design", role: "advisor", mode: "readonly" },
-          () => runDualDesign(cwd, args)
+          ({ signal }) => runDualDesign(cwd, args, { signal })
         );
       }
-      return await runDualDesign(cwd, args);
+      const controller = new AbortController();
+      const promise = runDualDesign(cwd, args, { signal: controller.signal });
+      registerActiveAbortController(controller, promise);
+      return await promise;
     }
 
-    case "relay_copy_review":
-      return await runCopyReview(cwd, args);
+    case "relay_copy_review": {
+      const controller = new AbortController();
+      const promise = runCopyReview(cwd, args, { signal: controller.signal });
+      registerActiveAbortController(controller, promise);
+      return await promise;
+    }
 
     case "relay_orchestrate": {
       assertRecursionSafe(cwd);
@@ -489,24 +559,16 @@ async function handleToolCall(name, args = {}) {
           ({ signal }) => runOrchestration(cwd, args, { signal })
         );
       }
-      const res = await runOrchestration(cwd, args);
+      const controller = new AbortController();
+      const promise = runOrchestration(cwd, args, { signal: controller.signal });
+      registerActiveAbortController(controller, promise);
+      const res = await promise;
       return { isToolError: !res.ok, data: res };
     }
 
     case "relay_apply": {
-      const detail = await handleJobControl(cwd, { action: "result", jobId: args.jobId });
-      const job = detail.job;
-      if (job?.status !== "completed") {
-        throw new Error(`Refusing to apply patch from non-completed job "${args.jobId}" (status=${job?.status ?? "unknown"}).`);
-      }
-      if (Array.isArray(job?.scopeViolations) && job.scopeViolations.length > 0) {
-        throw new Error(`Refusing to apply patch with scope violation(s): ${job.scopeViolations.join("; ")}`);
-      }
-      const patchPath = job?.patchPath;
-      if (!patchPath) {
-        throw new Error(`Job "${args.jobId}" has no captured patchPath.`);
-      }
-      return applyWorktreePatch(cwd, patchPath, { mode: args.mode || "check" });
+      const detail = await handleJobControl(cwd, { action: "result", jobId: args.jobId, exact: true });
+      return applyJobPatch(cwd, detail.job, { mode: args.mode || "check" });
     }
 
     case "relay_handoff": {
@@ -532,17 +594,28 @@ async function handleToolCall(name, args = {}) {
     case "relay_board": {
       const boardId = args.boardId || "default";
       if (args.action === "read") {
-        const posts = readBoardPosts(cwd, boardId, { since: args.since ?? 0, limit: args.limit ?? 100 });
+        if (Array.isArray(args.seqs) && args.seqs.length > 0) {
+          return { boardId, view: "seqs", posts: readBoardPostsBySeqs(cwd, boardId, args.seqs) };
+        }
+        if (args.pinsOnly) {
+          return { boardId, view: "pinsOnly", pins: readActiveBoardPins(cwd, boardId) };
+        }
         if (args.view === "full") {
+          const fullLimit = args.limit !== undefined ? args.limit : 0;
+          const posts = readBoardPosts(cwd, boardId, { since: args.since ?? 0, limit: fullLimit });
           return { boardId, view: "full", posts };
         }
-        return buildTieredBoardView(posts, { boardId });
+        const posts = readBoardPosts(cwd, boardId, { since: args.since ?? 0, limit: args.limit ?? 100 });
+        const activePins = readActiveBoardPins(cwd, boardId);
+        return buildTieredBoardView(posts, { pinnedPosts: activePins, boardId, cwd });
       }
       if (args.action === "post") {
         return postBoardMessage(cwd, boardId, {
           author: args.author || "coordinator",
           tag: args.tag || "[update]",
-          text: args.text || ""
+          text: args.text || "",
+          pinId: args.pinId,
+          supersedes: args.supersedes
         });
       }
       throw new Error(`Unknown relay_board action: ${args.action}`);
@@ -572,6 +645,10 @@ async function handleRequest(msg) {
   }
   const { id, method, params } = msg;
   if (id === undefined || id === null) {
+    return;
+  }
+  if (serverShuttingDown) {
+    sendError(id, -32000, "MCP server is shutting down.");
     return;
   }
 
@@ -615,12 +692,21 @@ async function handleRequest(msg) {
 
         const allowUnboundedRecall =
           (toolName === "relay_jobs" && toolArgs.compact === false) ||
-          (toolName === "relay_board" && toolArgs.view === "full") ||
-          toolName === "relay_handoff";
+          (toolName === "relay_board" && (toolArgs.view === "full" || toolArgs.pinsOnly === true || Array.isArray(toolArgs.seqs))) ||
+          ((toolName === "relay_review" || toolName === "relay_review_gate") && (toolArgs.action === "inspect" || Boolean(toolArgs.reviewId))) ||
+          (toolName === "relay_handoff" && toolArgs.action === "inspect");
+
+        const recallCwd =
+          payload && typeof payload === "object" && typeof payload.workspaceRoot === "string"
+            ? payload.workspaceRoot
+            : typeof toolArgs.cwd === "string" && toolArgs.cwd.trim()
+              ? resolveWorkspaceRoot(toolArgs.cwd)
+              : null;
 
         const serialized = serializeMcpPayload(toolName, payload, {
           maxBytes: resolveMcpMaxBytes(),
-          compact: !allowUnboundedRecall
+          compact: !allowUnboundedRecall,
+          cwd: recallCwd
         });
 
         sendResponse(id, {
@@ -644,6 +730,31 @@ async function handleRequest(msg) {
 
 export function startMcpServer() {
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  let shutdownPromise = null;
+  const shutdown = async (exitOnFinish = false) => {
+    serverShuttingDown = true;
+    try {
+      rl.close();
+    } catch {
+      // Ignore close failure.
+    }
+    if (!shutdownPromise) {
+      shutdownPromise = cancelAllActiveInProcessJobs(2500).catch(() => {});
+    }
+    await shutdownPromise;
+    if (exitOnFinish) {
+      process.exit(0);
+    }
+  };
+  rl.on("close", () => {
+    void shutdown(false);
+  });
+  process.on("SIGTERM", () => {
+    void shutdown(true);
+  });
+  process.on("SIGINT", () => {
+    void shutdown(true);
+  });
   rl.on("line", (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;

@@ -29,6 +29,13 @@ if (recordFile) {
   );
 }
 
+if (process.env.TRIRELAY_TEST_DELAY_MS) {
+  const delayMs = Math.max(0, Number(process.env.TRIRELAY_TEST_DELAY_MS) || 0);
+  if (delayMs > 0) {
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+}
+
 if (process.env.TRIRELAY_TEST_CLAUDE_FAIL === "1") {
   console.error("simulated claude failure");
   process.exit(1);
@@ -44,26 +51,45 @@ if (isCopy) {
     rows: [{ location: "README:1", current: "Done now", problem: "Wordy", suggestion: "Ready" }]
   };
 } else if (isReview) {
-  structured =
-    process.env.TRIRELAY_TEST_REVIEW_BLOCKING === "1"
-      ? {
-          verdict: "needs-attention",
-          summary: "Blocking bug found",
-          findings: [
-            {
-              severity: "blocking",
-              title: "Auth bypass",
-              body: "Missing token check",
-              file: "src/auth.js",
-              line_start: 10,
-              line_end: 12,
-              trigger_path: "Unauthenticated request to /admin bypasses check",
-              recommendation: "Enforce token check"
-            }
-          ],
-          next_steps: ["Fix auth check"]
-        }
-      : { verdict: "approve", summary: "Clean", findings: [], next_steps: [] };
+  const manyCount = Number.parseInt(process.env.TRIRELAY_TEST_MANY_FINDINGS || "0", 10);
+  if (manyCount > 0) {
+    structured = {
+      verdict: "needs-attention",
+      summary: `${manyCount} blocking defects detected`,
+      findings: Array.from({ length: manyCount }, (_, i) => ({
+        severity: "blocking",
+        title: `Critical defect #${i + 1}: unchecked boundary condition in handler`,
+        body: `Detailed explanation for finding #${i + 1}: `.repeat(25),
+        file: `src/module_${i + 1}.js`,
+        line_start: 10 + i,
+        line_end: 25 + i,
+        trigger_path: `Caller invokes endpoint_${i + 1} with negative quantity triggering integer underflow #${i + 1}`,
+        recommendation: `Validate and clamp input in module_${i + 1}.js before state mutation.`
+      })),
+      next_steps: ["Inspect paginated findings and patch all blocking items"]
+    };
+  } else {
+    structured =
+      process.env.TRIRELAY_TEST_REVIEW_BLOCKING === "1"
+        ? {
+            verdict: "needs-attention",
+            summary: "Blocking bug found",
+            findings: [
+              {
+                severity: "blocking",
+                title: "Auth bypass",
+                body: "Missing token check",
+                file: "src/auth.js",
+                line_start: 10,
+                line_end: 12,
+                trigger_path: "Unauthenticated request to /admin bypasses check",
+                recommendation: "Enforce token check"
+              }
+            ],
+            next_steps: ["Fix auth check"]
+          }
+        : { verdict: "approve", summary: "Clean", findings: [], next_steps: [] };
+  }
 } else if (hasSchema) {
   structured = { status: "done", summary: "ok", findings: [], files_touched: [], checks_run: [], next_actions: [] };
 }

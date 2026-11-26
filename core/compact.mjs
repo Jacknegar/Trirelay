@@ -74,7 +74,6 @@ export function formatBoardStub(post, maxSummaryChars = 120) {
   let summary = collapsed;
   if (collapsed.length > maxSummaryChars) {
     const cut = Math.max(16, maxSummaryChars - 3);
-    // Respect surrogate pairs if slicing inside astral characters.
     let end = cut;
     const code = collapsed.charCodeAt(end - 1);
     if (code >= 0xd800 && code <= 0xdbff) {
@@ -93,40 +92,73 @@ export function formatBoardStub(post, maxSummaryChars = 120) {
   };
 }
 
+/**
+ * Build a 3-tier board view (Pin -> Programmatic Stub -> On-Demand Recall).
+ * Merges active pins from `pinnedPosts` so early pins survive past sliding windows,
+ * avoids silently slicing active pins when within budget, and explicitly reports
+ * any omitted or truncated pins with exact recall coordinates.
+ */
 export function buildTieredBoardView(
   posts = [],
-  { recentFull = 3, maxStubChars = 120, maxBytes = 2400, boardId = "default" } = {}
+  { pinnedPosts = null, recentFull = 3, maxStubChars = 120, maxBytes = 2400, boardId = "default", cwd = null } = {}
 ) {
-  const list = Array.isArray(posts) ? posts : [];
+  const cwdPrefix = cwd ? `cwd=${JSON.stringify(cwd)}, ` : "";
+  const rawPosts = Array.isArray(posts) ? posts : [];
+  const activePins = Array.isArray(pinnedPosts) ? pinnedPosts.filter((p) => p && (p.status == null || p.status === "active")) : [];
+  const activePinSeqs = new Set(activePins.map((p) => p.seq).filter((s) => s != null));
+  const mergedBySeq = new Map();
+  for (const p of activePins) {
+    if (p?.seq != null) mergedBySeq.set(p.seq, { ...p, _isActivePin: true });
+  }
+  for (const p of rawPosts) {
+    if (!p) continue;
+    const key = p.seq ?? Symbol("anon");
+    const tagLower = String(p.tag ?? "").toLowerCase();
+    const isActivePin =
+      pinnedPosts !== null
+        ? activePinSeqs.has(p.seq)
+        : PINNED_BOARD_TAGS.has(tagLower);
+    const prev = mergedBySeq.get(key);
+    mergedBySeq.set(key, { ...(prev ?? {}), ...p, _isActivePin: prev?._isActivePin || isActivePin });
+  }
+
+  const list = [...mergedBySeq.values()].sort((a, b) => Number(a.seq ?? 0) - Number(b.seq ?? 0));
   if (list.length === 0) {
     return {
       view: "tiered",
       boardId,
       totalPosts: 0,
+      pinnedTotal: 0,
+      pinnedShown: 0,
       pinnedCount: 0,
       stubCount: 0,
       recentCount: 0,
+      omittedPinnedCount: 0,
+      omittedPinnedSeqs: [],
+      truncatedPinnedSeqs: [],
       posts: [],
-      recallHint: `relay_board(action="read", boardId="${boardId}", view="full")`
+      recallHint: `relay_board(action="read", ${cwdPrefix}boardId="${boardId}", view="full")`
     };
   }
 
   const recentStart = Math.max(0, list.length - Math.max(0, recentFull));
   const items = list.map((p, idx) => {
-    const tagLower = String(p?.tag ?? "").toLowerCase();
-    const isPinned = PINNED_BOARD_TAGS.has(tagLower);
+    const isPinned = Boolean(p._isActivePin);
     const isRecent = idx >= recentStart;
     if (isPinned || isRecent) {
+      const textStr = String(p?.text ?? "");
       return {
         pinned: isPinned,
         recent: isRecent,
         entry: {
           seq: p?.seq ?? null,
+          ...(p?.pinId ? { pinId: p.pinId } : {}),
           timestamp: p?.timestamp ?? null,
           author: p?.author ?? "unknown",
           tag: p?.tag ?? "[update]",
           ...(Array.isArray(p?.mentions) && p.mentions.length > 0 ? { mentions: p.mentions } : {}),
-          text: truncateWithByteNotice(String(p?.text ?? ""), 400),
+          // Do NOT blindly slice active pins at 400B; preserve full hard constraints whenever budget allows.
+          text: isPinned ? textStr : truncateWithByteNotice(textStr, 400),
           ...(p?.handoffId ? { handoffId: p.handoffId } : {}),
           ...(p?.patchPath ? { patchPath: p.patchPath } : {}),
           ...(p?.model ? { model: p.model } : {}),
@@ -142,8 +174,12 @@ export function buildTieredBoardView(
   });
 
   const fitsBudget = (arr) => Buffer.byteLength(JSON.stringify(arr), "utf8") <= maxBytes;
+  const allPinnedSeqs = items.filter((i) => i.pinned && i.entry.seq != null).map((i) => i.entry.seq);
+  const pinnedOriginalBytes = new Map(
+    items.filter((i) => i.pinned).map((i) => [i.entry.seq, Buffer.byteLength(String(i.entry.text ?? ""), "utf8")])
+  );
 
-  // Phase 1: convert non-pinned recent full posts (oldest first) into stubs if needed.
+  // Phase 1: convert non-pinned recent full posts into compact stubs if needed.
   let active = items;
   if (!fitsBudget(active.map((i) => i.entry))) {
     active = active.map((i) => {
@@ -154,14 +190,15 @@ export function buildTieredBoardView(
     });
   }
 
-  // Phase 2: drop oldest non-pinned stubs until within budget (never drop pinned decisions first).
+  // Phase 2: drop oldest non-pinned entries first so active pins are preserved intact.
   while (active.length > 0 && !fitsBudget(active.map((i) => i.entry))) {
     const dropIdx = active.findIndex((i) => !i.pinned);
     if (dropIdx === -1) break;
     active = [...active.slice(0, dropIdx), ...active.slice(dropIdx + 1)];
   }
 
-  // Phase 3: if even pinned posts exceed maxBytes, tighten pinned fields proportionally, then trim oldest.
+  // Phase 3: if active pins alone exceed maxBytes, tighten proportionally, then omit oldest pins and report honestly.
+  const truncatedPinnedSeqs = new Set();
   if (!fitsBudget(active.map((i) => i.entry))) {
     const perPinnedBudget = Math.max(48, Math.floor(maxBytes / Math.max(1, active.length)) - 64);
     active = active.map((i) => {
@@ -175,31 +212,41 @@ export function buildTieredBoardView(
       if (e.patchPath && Buffer.byteLength(e.patchPath, "utf8") > 96) {
         e.patchPath = truncateWithByteNotice(e.patchPath, 96);
       }
-      if (e.text) {
+      if (e.text && Buffer.byteLength(e.text, "utf8") > perPinnedBudget) {
         e.text = truncateWithByteNotice(e.text, perPinnedBudget);
+        if (i.pinned && e.seq != null) truncatedPinnedSeqs.add(e.seq);
       }
-      if (e.summary) {
+      if (e.summary && Buffer.byteLength(e.summary, "utf8") > perPinnedBudget) {
         e.summary = truncateWithByteNotice(e.summary, perPinnedBudget);
+        if (i.pinned && e.seq != null) truncatedPinnedSeqs.add(e.seq);
       }
       return { ...i, entry: e };
     });
     while (active.length > 1 && !fitsBudget(active.map((i) => i.entry))) {
-      active.shift();
+      // Drop transient [blocker] auto-pins before explicit [decision] / [invariant] / [pin] records.
+      const blockerIdx = active.findIndex((i) => String(i.entry?.tag || "") === "[blocker]");
+      if (blockerIdx !== -1) {
+        active.splice(blockerIdx, 1);
+      } else {
+        active.shift();
+      }
     }
-    // Guarantee single remaining entry still fits inside maxBytes.
     if (active.length === 1 && !fitsBudget(active.map((i) => i.entry))) {
       const e = active[0].entry;
       const room = Math.max(24, maxBytes - 160);
-      active[0] = {
-        ...active[0],
-        entry: {
-          seq: e.seq ?? null,
-          tag: sliceUtf8Bytes(String(e.tag ?? "[pin]"), 24),
-          author: sliceUtf8Bytes(String(e.author ?? "worker"), 32),
-          ...(e.text ? { text: truncateWithByteNotice(e.text, room) } : { summary: truncateWithByteNotice(String(e.summary ?? ""), room) }),
-          ...(e.pinned ? { pinned: true } : {})
-        }
+      const nextEntry = {
+        seq: e.seq ?? null,
+        tag: sliceUtf8Bytes(String(e.tag ?? "[pin]"), 24),
+        author: sliceUtf8Bytes(String(e.author ?? "worker"), 32),
+        ...(e.text
+          ? { text: truncateWithByteNotice(e.text, room) }
+          : { summary: truncateWithByteNotice(String(e.summary ?? ""), room) }),
+        ...(e.pinned ? { pinned: true } : {})
       };
+      if (active[0].pinned && e.seq != null && Buffer.byteLength(String(nextEntry.text ?? ""), "utf8") < (pinnedOriginalBytes.get(e.seq) ?? 0)) {
+        truncatedPinnedSeqs.add(e.seq);
+      }
+      active[0] = { ...active[0], entry: nextEntry };
       if (!fitsBudget(active.map((i) => i.entry))) {
         active = [];
       }
@@ -207,15 +254,31 @@ export function buildTieredBoardView(
   }
 
   const finalEntries = active.map((i) => i.entry);
+  const shownPinnedSeqs = new Set(active.filter((i) => i.pinned && i.entry.seq != null).map((i) => i.entry.seq));
+  const omittedPinnedSeqs = allPinnedSeqs.filter((seq) => !shownPinnedSeqs.has(seq));
+  const truncatedArr = [...truncatedPinnedSeqs].filter((seq) => shownPinnedSeqs.has(seq));
+  const needExactPinRecall = omittedPinnedSeqs.length > 0 || truncatedArr.length > 0;
+  const targetSeqs = [...new Set([...omittedPinnedSeqs, ...truncatedArr])];
+  const recallHint = needExactPinRecall
+    ? targetSeqs.length > 0
+      ? `relay_board(action="read", ${cwdPrefix}boardId="${boardId}", seqs=${JSON.stringify(targetSeqs)})`
+      : `relay_board(action="read", ${cwdPrefix}boardId="${boardId}", view="full", pinsOnly=true)`
+    : `relay_board(action="read", ${cwdPrefix}boardId="${boardId}", view="full")`;
+
   return {
     view: "tiered",
     boardId,
-    totalPosts: list.length,
-    pinnedCount: active.filter((i) => i.pinned).length,
+    totalPosts: Math.max(rawPosts.length, list.length),
+    pinnedTotal: allPinnedSeqs.length,
+    pinnedShown: shownPinnedSeqs.size,
+    pinnedCount: shownPinnedSeqs.size,
     stubCount: finalEntries.filter((e) => e.stub).length,
     recentCount: finalEntries.filter((e) => !e.stub).length,
+    omittedPinnedCount: omittedPinnedSeqs.length,
+    omittedPinnedSeqs,
+    truncatedPinnedSeqs: truncatedArr,
     posts: finalEntries,
-    recallHint: `relay_board(action="read", boardId="${boardId}", view="full")`
+    recallHint
   };
 }
 
@@ -223,25 +286,57 @@ function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function buildRecallPointer(toolName, payload) {
-  const jobId = payload?.jobId || payload?.job?.id;
+function unwrapJobPayload(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  if (payload.job && typeof payload.job === "object") {
+    const jobResult = payload.job.result && typeof payload.job.result === "object" ? payload.job.result : {};
+    return {
+      ...jobResult,
+      ...payload.job,
+      ...payload,
+      reviewId: payload.reviewId || payload.job.reviewId || jobResult.reviewId || null,
+      decision: payload.decision || payload.job.decision || jobResult.decision || null,
+      verdict: payload.verdict || payload.job.verdict || jobResult.verdict || null,
+      totalFindings: payload.totalFindings ?? payload.job.totalFindings ?? jobResult.totalFindings ?? null,
+      blockingCount: payload.blockingCount ?? payload.job.blockingCount ?? jobResult.blockingCount ?? null,
+      advisoryCount: payload.advisoryCount ?? payload.job.advisoryCount ?? jobResult.advisoryCount ?? null,
+      blockingFindings: payload.blockingFindings ?? jobResult.blockingFindings,
+      remainingBlockingFindings: payload.remainingBlockingFindings ?? jobResult.remainingBlockingFindings,
+      findings: payload.findings ?? jobResult.findings,
+      deliverableMode: payload.deliverableMode || payload.job.deliverableMode || jobResult.deliverableMode || null,
+      ignoredOnlyDeliverables: payload.ignoredOnlyDeliverables ?? payload.job.ignoredOnlyDeliverables ?? jobResult.ignoredOnlyDeliverables,
+      ignoredFiles: payload.ignoredFiles ?? payload.job.ignoredFiles ?? jobResult.ignoredFiles,
+      worktreePath: payload.worktreePath || payload.job.worktreePath || jobResult.worktreePath || null
+    };
+  }
+  return payload;
+}
+
+function buildRecallPointer(toolName, payload, { cwd = null } = {}) {
+  const view = unwrapJobPayload(payload);
+  const targetCwd = cwd || view?.cwd || view?.workspaceRoot || payload?.cwd || payload?.workspaceRoot || null;
+  const cwdPrefix = targetCwd ? `cwd=${JSON.stringify(targetCwd)}, ` : "";
+  if (view?.reviewId) {
+    return `relay_review(action="inspect", ${cwdPrefix}reviewId="${view.reviewId}", offset=0, limit=10)`;
+  }
+  const jobId = view?.jobId || view?.job?.id || view?.id;
   if (jobId) {
-    return `relay_jobs(action="result", jobId="${jobId}", compact=false)`;
+    return `relay_jobs(action="result", ${cwdPrefix}jobId="${jobId}", compact=false)`;
   }
-  if (payload?.handoffId || payload?.packet?.handoffId) {
-    const hid = payload?.handoffId || payload?.packet?.handoffId;
-    return `relay_handoff(action="inspect", handoffId="${hid}")`;
+  if (view?.handoffId || view?.packet?.handoffId) {
+    const hid = view?.handoffId || view?.packet?.handoffId;
+    return `relay_handoff(action="inspect", ${cwdPrefix}handoffId="${hid}")`;
   }
-  if (payload?.boardId) {
-    return `relay_board(action="read", boardId="${payload.boardId}", view="full")`;
+  if (view?.boardId) {
+    return `relay_board(action="read", ${cwdPrefix}boardId="${view.boardId}", view="full")`;
   }
-  return toolName ? `Re-run ${toolName} with narrower scope or read artifacts directly.` : "Inspect artifact paths directly.";
+  return toolName ? `Inspect local job/artifact records for ${toolName} directly.` : "Inspect artifact paths directly.";
 }
 
 function shrinkBulkyStrings(obj, perFieldBytes, stripStructuredOutput = false) {
   if (!obj || typeof obj !== "object") return obj;
 
-  const stringFields = ["output", "rawOutput", "logTail", "hostDraft", "diff", "contextDigest", "text"];
+  const stringFields = ["output", "rawOutput", "logTail", "hostDraft", "diff", "contextDigest", "text", "body", "trigger_path", "recommendation"];
   for (const field of stringFields) {
     if (typeof obj[field] === "string" && Buffer.byteLength(obj[field], "utf8") > perFieldBytes) {
       obj[field] = truncateWithByteNotice(obj[field], perFieldBytes);
@@ -258,7 +353,7 @@ function shrinkBulkyStrings(obj, perFieldBytes, stripStructuredOutput = false) {
     }
   }
 
-  for (const arrKey of ["reviews", "perspectives", "critiques", "stages", "workers", "posts", "findings", "blockingFindings", "advisoryFindings"]) {
+  for (const arrKey of ["reviews", "perspectives", "critiques", "stages", "workers", "posts", "findings", "blockingFindings", "remainingBlockingFindings", "advisoryFindings"]) {
     if (Array.isArray(obj[arrKey])) {
       for (const item of obj[arrKey]) {
         if (item && typeof item === "object") {
@@ -271,52 +366,143 @@ function shrinkBulkyStrings(obj, perFieldBytes, stripStructuredOutput = false) {
   return obj;
 }
 
-function buildMinimalSummary(toolName, payload, originalBytes, maxBytes) {
-  const recallFull = buildRecallPointer(toolName, payload);
-  const rawJobId = payload?.jobId || payload?.job?.id || null;
-  const rawHandoffId = payload?.handoffId || payload?.packet?.handoffId || null;
-  const rawPatchPath = payload?.patchPath || payload?.job?.patchPath || null;
+function isBlockingLike(finding) {
+  const s = String(finding?.severity ?? "").toLowerCase();
+  return s === "blocking" || s === "critical" || s === "high";
+}
+
+function buildBlockingPreview(payload, maxItems = 6) {
+  const view = unwrapJobPayload(payload);
+  const source = Array.isArray(view?.blockingFindings) && view.blockingFindings.length
+    ? view.blockingFindings
+    : Array.isArray(view?.remainingBlockingFindings) && view.remainingBlockingFindings.length
+      ? view.remainingBlockingFindings
+      : Array.isArray(view?.findings)
+        ? view.findings.filter(isBlockingLike)
+        : [];
+  return source.slice(0, maxItems).map((f, idx) => ({
+    id: f.id || `F${idx + 1}`,
+    file: sliceUtf8Bytes(String(f.file || "unknown"), 64),
+    ...(f.line_start != null ? { line: f.line_start } : {}),
+    title: sliceUtf8Bytes(String(f.title || ""), 80),
+    ...(f.trigger_path ? { trigger: sliceUtf8Bytes(String(f.trigger_path), 100) } : {})
+  }));
+}
+
+function buildMinimalSummary(toolName, payload, originalBytes, maxBytes, { cwd = null } = {}) {
+  const view = unwrapJobPayload(payload);
+  const recallFull = buildRecallPointer(toolName, view, { cwd });
+  const rawJobId = view?.jobId || view?.job?.id || view?.id || null;
+  const rawHandoffId = view?.handoffId || view?.packet?.handoffId || null;
+  const rawPatchPath = view?.patchPath || view?.job?.patchPath || null;
+  const rawWorktreePath = view?.worktreePath || view?.job?.worktreePath || null;
+  const rawDeliverableMode = view?.deliverableMode || view?.job?.deliverableMode || null;
+  const rawIgnoredOnly = view?.ignoredOnlyDeliverables ?? view?.job?.ignoredOnlyDeliverables;
+  const rawIgnoredFiles = view?.ignoredFiles || view?.job?.ignoredFiles;
+  const rawReviewId = view?.reviewId || null;
+
+  const totalFindings =
+    view?.totalFindings ??
+    (Array.isArray(view?.findings)
+      ? view.findings.length
+      : (Array.isArray(view?.blockingFindings) || Array.isArray(view?.advisoryFindings))
+        ? (view?.blockingFindings?.length ?? 0) + (view?.advisoryFindings?.length ?? 0)
+        : Array.isArray(view?.remainingBlockingFindings)
+          ? view.remainingBlockingFindings.length
+          : null);
+  const blockingCount =
+    view?.blockingCount ??
+    (Array.isArray(view?.blockingFindings)
+      ? view.blockingFindings.length
+      : Array.isArray(view?.remainingBlockingFindings)
+        ? view.remainingBlockingFindings.length
+        : Array.isArray(view?.findings)
+          ? view.findings.filter(isBlockingLike).length
+          : null);
+  const advisoryCount =
+    view?.advisoryCount ??
+    (Array.isArray(view?.advisoryFindings)
+      ? view.advisoryFindings.length
+      : totalFindings != null && blockingCount != null
+        ? totalFindings - blockingCount
+        : null);
+
+  const blockingPreview = buildBlockingPreview(view, 5);
 
   const base = {
-    ...(typeof payload?.ok === "boolean" ? { ok: payload.ok } : {}),
-    ...(payload?.status ? { status: sliceUtf8Bytes(String(payload.status), 32) } : {}),
+    ...(typeof view?.ok === "boolean" ? { ok: view.ok } : {}),
+    ...(view?.status ? { status: sliceUtf8Bytes(String(view.status), 32) } : {}),
+    ...(rawReviewId ? { reviewId: sliceUtf8Bytes(String(rawReviewId), 96) } : {}),
+    ...(view?.artifactPath ? { artifactPath: truncateWithByteNotice(String(view.artifactPath), Math.min(200, Math.floor(maxBytes / 4))) } : {}),
+    ...(view?.cycleId ? { cycleId: sliceUtf8Bytes(String(view.cycleId), 64) } : {}),
+    ...(view?.round != null ? { round: view.round } : {}),
     ...(rawJobId ? { jobId: sliceUtf8Bytes(String(rawJobId), 96) } : {}),
     ...(rawHandoffId ? { handoffId: sliceUtf8Bytes(String(rawHandoffId), 96) } : {}),
     ...(rawPatchPath ? { patchPath: truncateWithByteNotice(String(rawPatchPath), Math.min(200, Math.floor(maxBytes / 4))) } : {}),
-    ...(payload?.verdict ? { verdict: sliceUtf8Bytes(String(payload.verdict), 32) } : {}),
-    ...(payload?.decision ? { decision: sliceUtf8Bytes(String(payload.decision), 32) } : {}),
-    ...(payload?.designId ? { designId: sliceUtf8Bytes(String(payload.designId), 96) } : {}),
-    ...(payload?.gateKey ? { gateKey: sliceUtf8Bytes(String(payload.gateKey), 96) } : {}),
-    ...(payload?.sessionId ? { sessionId: sliceUtf8Bytes(String(payload.sessionId), 96) } : {}),
-    ...(payload?.durationMs != null ? { durationMs: payload.durationMs } : {}),
-    ...(Array.isArray(payload?.changedFiles) ? { changedFiles: payload.changedFiles.slice(0, 8).map((f) => sliceUtf8Bytes(String(f), 80)) } : {}),
-    ...(Array.isArray(payload?.scopeViolations) && payload.scopeViolations.length
-      ? { scopeViolations: payload.scopeViolations.slice(0, 3).map((v) => sliceUtf8Bytes(String(v), 100)) }
+    ...(rawWorktreePath ? { worktreePath: truncateWithByteNotice(String(rawWorktreePath), Math.min(200, Math.floor(maxBytes / 4))) } : {}),
+    ...(rawDeliverableMode ? { deliverableMode: sliceUtf8Bytes(String(rawDeliverableMode), 32) } : {}),
+    ...(typeof rawIgnoredOnly === "boolean" ? { ignoredOnlyDeliverables: rawIgnoredOnly } : {}),
+    ...(Array.isArray(rawIgnoredFiles) && rawIgnoredFiles.length
+      ? { ignoredFiles: rawIgnoredFiles.slice(0, 6).map((f) => sliceUtf8Bytes(String(f), 80)) }
       : {}),
-    ...(payload?.error ? { error: truncateWithByteNotice(payload.error, Math.min(240, Math.floor(maxBytes / 5))) } : {}),
+    ...(view?.verdict ? { verdict: sliceUtf8Bytes(String(view.verdict), 32) } : {}),
+    ...(view?.decision ? { decision: sliceUtf8Bytes(String(view.decision), 32) } : {}),
+    ...(totalFindings != null ? { totalFindings } : {}),
+    ...(blockingCount != null ? { blockingCount } : {}),
+    ...(advisoryCount != null ? { advisoryCount } : {}),
+    ...(blockingPreview.length > 0 ? { blockingPreview } : {}),
+    ...(view?.designId ? { designId: sliceUtf8Bytes(String(view.designId), 96) } : {}),
+    ...(view?.gateKey ? { gateKey: sliceUtf8Bytes(String(view.gateKey), 96) } : {}),
+    ...(view?.sessionId ? { sessionId: sliceUtf8Bytes(String(view.sessionId), 96) } : {}),
+    ...(view?.durationMs != null ? { durationMs: view.durationMs } : {}),
+    ...(Array.isArray(view?.changedFiles) ? { changedFiles: view.changedFiles.slice(0, 8).map((f) => sliceUtf8Bytes(String(f), 80)) } : {}),
+    ...(Array.isArray(view?.scopeViolations) && view.scopeViolations.length
+      ? { scopeViolations: view.scopeViolations.slice(0, 3).map((v) => sliceUtf8Bytes(String(v), 100)) }
+      : {}),
+    ...(view?.error ? { error: truncateWithByteNotice(view.error, Math.min(240, Math.floor(maxBytes / 5))) } : {}),
     _compacted: true,
     _originalBytes: originalBytes,
-    _recall: truncateWithByteNotice(recallFull, Math.min(220, Math.floor(maxBytes / 4)))
+    _recall: truncateWithByteNotice(recallFull, Math.max(256, Math.floor(maxBytes * 0.6)))
   };
 
   if (Buffer.byteLength(JSON.stringify(base), "utf8") <= maxBytes) {
     return base;
   }
 
+  // Trim blockingPreview items progressively before dropping counts/IDs.
+  while (Array.isArray(base.blockingPreview) && base.blockingPreview.length > 1) {
+    base.blockingPreview.pop();
+    if (Buffer.byteLength(JSON.stringify(base), "utf8") <= maxBytes) {
+      return base;
+    }
+  }
+
   const dropOrder = [
+    "ignoredFiles",
     "changedFiles",
     "scopeViolations",
+    "artifactPath",
     "error",
+    "worktreePath",
     "patchPath",
+    "blockingPreview",
     "sessionId",
     "designId",
     "gateKey",
+    "cycleId",
+    "round",
     "durationMs",
+    "advisoryCount",
+    "ignoredOnlyDeliverables",
+    "deliverableMode",
     "verdict",
     "decision",
     "status",
     "handoffId",
-    "jobId"
+    "jobId",
+    "totalFindings",
+    "blockingCount",
+    "reviewId"
   ];
   for (const key of dropOrder) {
     delete base[key];
@@ -338,7 +524,29 @@ function buildMinimalSummary(toolName, payload, originalBytes, maxBytes) {
   return { _compacted: true };
 }
 
-export function compactMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxBytes(), enabled = true } = {}) {
+function decorateCompactedMetadata(target, toolName, payload, originalBytes, preview1, { cwd = null } = {}) {
+  const view = unwrapJobPayload(payload);
+  target._compacted = true;
+  target._originalBytes = originalBytes;
+  target._recall = buildRecallPointer(toolName, payload, { cwd });
+  if (view && view !== payload) {
+    if (view.reviewId && target.reviewId === undefined) target.reviewId = view.reviewId;
+    if (view.decision && target.decision === undefined) target.decision = view.decision;
+    if (view.verdict && target.verdict === undefined) target.verdict = view.verdict;
+    if (view.blockingCount != null && target.blockingCount === undefined) target.blockingCount = view.blockingCount;
+    if (view.totalFindings != null && target.totalFindings === undefined) target.totalFindings = view.totalFindings;
+    if (view.deliverableMode && target.deliverableMode === undefined) target.deliverableMode = view.deliverableMode;
+    if (typeof view.ignoredOnlyDeliverables === "boolean" && target.ignoredOnlyDeliverables === undefined) {
+      target.ignoredOnlyDeliverables = view.ignoredOnlyDeliverables;
+    }
+  }
+  if (preview1.length > 0 && target.blockingPreview === undefined) {
+    target.blockingPreview = preview1;
+  }
+  return target;
+}
+
+export function compactMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxBytes(), enabled = true, cwd = null } = {}) {
   if (!enabled || payload == null || typeof payload !== "object") {
     return payload;
   }
@@ -349,32 +557,49 @@ export function compactMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxB
     return payload;
   }
 
-  // Pass 1: truncate bulky text fields (~700 bytes each), preserving structured arrays/metadata.
-  const pass1 = shrinkBulkyStrings(cloneJson(payload), Math.min(700, Math.floor(budget * 0.25)), false);
-  pass1._compacted = true;
-  pass1._originalBytes = originalBytes;
-  pass1._recall = buildRecallPointer(toolName, payload);
+  const preview1 = buildBlockingPreview(payload, 5);
+  const isWrappedJobResult = Boolean(payload?.job?.result && typeof payload.job.result === "object");
+
+  // Pass 1: truncate bulky text fields (~700 bytes each), preserving findings/metadata.
+  const pass1 = decorateCompactedMetadata(
+    shrinkBulkyStrings(cloneJson(payload), Math.min(700, Math.floor(budget * 0.25)), false),
+    toolName,
+    payload,
+    originalBytes,
+    preview1,
+    { cwd }
+  );
   if (Buffer.byteLength(JSON.stringify(pass1), "utf8") <= budget) {
     return pass1;
   }
 
   // Pass 2: aggressive string cap (~200 bytes) and strip duplicate per-worker structuredOutput.
-  const pass2 = shrinkBulkyStrings(cloneJson(payload), Math.min(200, Math.floor(budget * 0.1)), true);
+  const pass2 = decorateCompactedMetadata(
+    shrinkBulkyStrings(cloneJson(payload), Math.min(200, Math.floor(budget * 0.1)), true),
+    toolName,
+    payload,
+    originalBytes,
+    preview1,
+    { cwd }
+  );
   if (Array.isArray(pass2.posts) && pass2.posts.length > 6) {
-    pass2.posts = buildTieredBoardView(pass2.posts, { recentFull: 2, maxBytes: Math.floor(budget * 0.45) }).posts;
+    pass2.posts = buildTieredBoardView(pass2.posts, { recentFull: 2, maxBytes: Math.floor(budget * 0.45), cwd }).posts;
   }
-  pass2._compacted = true;
-  pass2._originalBytes = originalBytes;
-  pass2._recall = buildRecallPointer(toolName, payload);
   if (Buffer.byteLength(JSON.stringify(pass2), "utf8") <= budget) {
     return pass2;
   }
+  if (preview1.length > 0 && !isWrappedJobResult && "blockingPreview" in pass2) {
+    delete pass2.blockingPreview;
+    if (Buffer.byteLength(JSON.stringify(pass2), "utf8") <= budget) {
+      return pass2;
+    }
+  }
 
-  // Pass 3: guaranteed-bounded summary preserving control fields & recall IDs.
-  return buildMinimalSummary(toolName, payload, originalBytes, budget);
+  // Pass 3: guaranteed-bounded summary preserving reviewId, blockingPreview & exact recall pointer.
+  return buildMinimalSummary(toolName, payload, originalBytes, budget, { cwd });
 }
 
-export function serializeMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxBytes(), compact = true } = {}) {
+export function serializeMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxBytes(), compact = true, cwd = null } = {}) {
   if (!compact || payload == null || typeof payload !== "object") {
     const text = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
     return { text, compacted: false, bytes: Buffer.byteLength(text, "utf8") };
@@ -391,7 +616,7 @@ export function serializeMcpPayload(toolName, payload, { maxBytes = resolveMcpMa
     return { text: compactRaw, compacted: false, bytes: Buffer.byteLength(compactRaw, "utf8") };
   }
 
-  const compactedObj = compactMcpPayload(toolName, payload, { maxBytes: budget, enabled: true });
+  const compactedObj = compactMcpPayload(toolName, payload, { maxBytes: budget, enabled: true, cwd });
   const text = JSON.stringify(compactedObj);
   return {
     text,

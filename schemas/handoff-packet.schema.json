@@ -6,6 +6,7 @@
   "properties": {
     "handoffId": { "type": "string", "minLength": 1 },
     "parentHandoffId": { "type": ["string", "null"] },
+    "decisionVersion": { "type": "integer" },
     "workflowId": { "type": ["string", "null"] },
     "createdAt": { "type": "string" },
     "fromHost": { "type": "string", "enum": ["agy", "claude", "codex", "cli"] },
@@ -27,6 +28,9 @@
     "invariants": { "type": "array", "items": { "type": "string" } },
     "decisionsMade": { "type": "array", "items": { "type": "string" } },
     "doNotRelitigate": { "type": "array", "items": { "type": "string" } },
+    "supersededDecisions": { "type": "array", "items": { "type": "string" } },
+    "deprecatedInvariants": { "type": "array", "items": { "type": "string" } },
+    "boardDigest": { "type": "string" },
     "openQuestions": { "type": "array", "items": { "type": "string" } },
     "verification": {
       "type": "array",

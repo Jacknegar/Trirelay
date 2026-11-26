@@ -10,6 +10,7 @@ import {
   loadHostSession,
   lookupRoleSession,
   nowIso,
+  readActiveBoardPins,
   readBoardPosts,
   readJsonSafe,
   validateOpaqueId,
@@ -67,12 +68,24 @@ export function extractRepoHandoffHead(workspaceRoot, maxLines = 40) {
 }
 
 export function formatTieredBoardDigest(workspaceRoot, boardId = "default", { maxBytes = 1800 } = {}) {
-  const posts = readBoardPosts(workspaceRoot, boardId, { since: 0, limit: 200 });
-  if (!posts.length) return "";
-  const tiered = buildTieredBoardView(posts, { boardId, recentFull: 3, maxStubChars: 120, maxBytes });
+  const activePins = readActiveBoardPins(workspaceRoot, boardId);
+  const posts = readBoardPosts(workspaceRoot, boardId, { since: 0, limit: 100 });
+  if (!posts.length && !activePins.length) return "";
+  const tiered = buildTieredBoardView(posts, {
+    pinnedPosts: activePins,
+    boardId,
+    recentFull: 3,
+    maxStubChars: 120,
+    maxBytes
+  });
   const lines = [
-    `Board "${boardId}" (${tiered.totalPosts} total: ${tiered.pinnedCount} pinned, ${tiered.stubCount} stub, ${tiered.recentCount} recent; recall: ${tiered.recallHint})`
+    `Board "${boardId}" (${tiered.totalPosts} total: ${tiered.pinnedShown}/${tiered.pinnedTotal} active pins, ${tiered.stubCount} stub, ${tiered.recentCount} recent; recall: ${tiered.recallHint})`
   ];
+  if (tiered.omittedPinnedCount > 0 || tiered.truncatedPinnedSeqs.length > 0) {
+    lines.push(
+      `[WARNING] ${tiered.omittedPinnedCount} active pin(s) omitted (${tiered.omittedPinnedSeqs.join(",") || "none"}) and ${tiered.truncatedPinnedSeqs.length} truncated (${tiered.truncatedPinnedSeqs.join(",") || "none"}) due to ${maxBytes}B budget — recall full pins via: ${tiered.recallHint}`
+    );
+  }
   for (const item of tiered.posts) {
     if (item.stub) {
       lines.push(`- #${item.seq} ${item.tag} [${item.author}] ${item.summary}${item.patchPath ? ` (patch: ${item.patchPath})` : ""}`);
@@ -81,6 +94,153 @@ export function formatTieredBoardDigest(workspaceRoot, boardId = "default", { ma
     }
   }
   return lines.join("\n");
+}
+
+function dedupeStrings(list = []) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of list) {
+    const val = String(raw ?? "").trim();
+    if (!val || seen.has(val)) continue;
+    seen.add(val);
+    out.push(val);
+  }
+  return out;
+}
+
+function dedupeVerification(list = []) {
+  const out = [];
+  const seen = new Set();
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const key = `${item.cmd ?? ""}::${item.exit ?? ""}::${item.excerpt ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+function collectParentChain(workspaceRoot, parentHandoffId, maxDepth = 20) {
+  const chain = [];
+  const visited = new Set();
+  let cursor = parentHandoffId;
+  while (cursor && !visited.has(cursor) && chain.length < maxDepth) {
+    visited.add(cursor);
+    const parent = loadHandoffPacket(workspaceRoot, cursor);
+    if (!parent) {
+      if (chain.length === 0 && cursor === parentHandoffId) {
+        throw new Error(`Parent handoff packet "${parentHandoffId}" not found.`);
+      }
+      break;
+    }
+    chain.unshift(parent); // oldest ancestor first
+    cursor = parent.parentHandoffId ?? null;
+  }
+  return chain;
+}
+
+/**
+ * Inherit workflow-persistent constraints (invariants, decisionsMade, doNotRelitigate,
+ * acceptanceCriteria, verification, forbiddenFiles) chronologically across a handoff
+ * parent chain while NEVER copying stage-local scope (`ownedFiles`, `role`, `toEngine`, `goal`).
+ */
+export function resolveInheritedConstraints(workspaceRoot, parentHandoffId, input = {}) {
+  const chain = parentHandoffId && input.inheritParent !== false
+    ? collectParentChain(workspaceRoot, parentHandoffId)
+    : [];
+
+  const invSet = new Set();
+  const decSet = new Set();
+  const dnrSet = new Set();
+  const supAll = new Set();
+  const depInvAll = new Set();
+
+  for (const hop of [...chain, input]) {
+    const hopSup = new Set(dedupeStrings(hop.supersededDecisions ?? []));
+    const hopDepInv = new Set(dedupeStrings(hop.deprecatedInvariants ?? []));
+    const hopInv = dedupeStrings(hop.invariants ?? []);
+    const hopDec = dedupeStrings(hop.decisionsMade ?? []);
+    const hopDnr = dedupeStrings(hop.doNotRelitigate ?? []);
+
+    for (const dec of hopDec) {
+      if (hopSup.has(dec)) {
+        throw new Error(`Conflicting same-hop handoff constraint "${dec}" declared in both decisionsMade and supersededDecisions.`);
+      }
+    }
+    for (const dnr of hopDnr) {
+      if (hopSup.has(dnr)) {
+        throw new Error(`Conflicting same-hop handoff constraint "${dnr}" declared in both doNotRelitigate and supersededDecisions.`);
+      }
+    }
+    for (const inv of hopInv) {
+      if (hopDepInv.has(inv)) {
+        throw new Error(`Conflicting same-hop handoff constraint "${inv}" declared in both invariants and deprecatedInvariants.`);
+      }
+    }
+
+    for (const sup of hopSup) {
+      supAll.add(sup);
+      decSet.delete(sup);
+      dnrSet.delete(sup);
+    }
+    for (const dep of hopDepInv) {
+      depInvAll.add(dep);
+      invSet.delete(dep);
+    }
+    for (const inv of hopInv) {
+      depInvAll.delete(inv);
+      invSet.add(inv);
+    }
+    for (const dec of hopDec) {
+      supAll.delete(dec);
+      decSet.add(dec);
+    }
+    for (const dnr of hopDnr) {
+      supAll.delete(dnr);
+      dnrSet.add(dnr);
+    }
+  }
+
+  const invariants = [...invSet];
+  const decisionsMade = [...decSet];
+  const doNotRelitigate = [...dnrSet];
+  const acceptanceCriteria = dedupeStrings([
+    ...chain.flatMap((p) => p.acceptanceCriteria ?? []),
+    ...(input.acceptanceCriteria ?? [])
+  ]);
+  const verification = dedupeVerification([
+    ...chain.flatMap((p) => p.verification ?? []),
+    ...(input.verification ?? [])
+  ]);
+  const forbiddenFiles = dedupeStrings([
+    "docs/handoff.md",
+    ...chain.flatMap((p) => p.scope?.forbiddenFiles ?? []),
+    ...(Array.isArray(input.forbiddenFiles) ? input.forbiddenFiles : [])
+  ]);
+
+  const maxParentVersion = chain.reduce((m, p) => Math.max(m, Number(p.decisionVersion || 1)), 0);
+  const hasNewDecisionsOrSupersedes =
+    Boolean(input.decisionsMade?.length) ||
+    Boolean(input.invariants?.length) ||
+    Boolean(input.doNotRelitigate?.length) ||
+    Boolean(input.supersededDecisions?.length) ||
+    Boolean(input.deprecatedInvariants?.length);
+  const decisionVersion = chain.length > 0
+    ? maxParentVersion + (hasNewDecisionsOrSupersedes ? 1 : 0)
+    : 1;
+
+  return {
+    invariants,
+    decisionsMade,
+    doNotRelitigate,
+    supersededDecisions: [...supAll],
+    deprecatedInvariants: [...depInvAll],
+    decisionVersion,
+    acceptanceCriteria,
+    verification,
+    forbiddenFiles
+  };
 }
 
 export function createHandoffPacket(cwd, input = {}) {
@@ -99,6 +259,8 @@ export function createHandoffPacket(cwd, input = {}) {
     host: host === "cli" ? null : host,
     conversationId: input.agyConversationId ?? null
   });
+
+  const inherited = resolveInheritedConstraints(workspaceRoot, input.parentHandoffId ?? null, input);
 
   let contextDigest = String(input.contextDigest ?? "").trim();
   const digestParts = [];
@@ -130,6 +292,7 @@ export function createHandoffPacket(cwd, input = {}) {
   const packet = {
     handoffId,
     parentHandoffId: input.parentHandoffId ?? null,
+    decisionVersion: inherited.decisionVersion,
     workflowId: input.workflowId ?? "default",
     createdAt: nowIso(),
     fromHost: host,
@@ -138,21 +301,24 @@ export function createHandoffPacket(cwd, input = {}) {
     role: input.role ?? "worker",
     goal: String(input.goal ?? "").trim(),
     scope: {
-      ownedFiles: Array.isArray(input.ownedFiles) ? input.ownedFiles : [],
-      forbiddenFiles: Array.isArray(input.forbiddenFiles) ? input.forbiddenFiles : ["docs/handoff.md"],
+      // Stage-local file ownership is NEVER copied from parent handoffs.
+      ownedFiles: Array.isArray(input.ownedFiles) ? [...input.ownedFiles] : [],
+      forbiddenFiles: inherited.forbiddenFiles,
       worktreePath: input.worktreePath ?? null,
       branch: input.branch ?? getGitBranch(workspaceRoot),
       headSha: input.headSha ?? getGitHeadSha(workspaceRoot)
     },
-    invariants: Array.isArray(input.invariants) ? input.invariants : [],
-    decisionsMade: Array.isArray(input.decisionsMade) ? input.decisionsMade : [],
-    doNotRelitigate: Array.isArray(input.doNotRelitigate) ? input.doNotRelitigate : [],
+    invariants: inherited.invariants,
+    decisionsMade: inherited.decisionsMade,
+    doNotRelitigate: inherited.doNotRelitigate,
+    supersededDecisions: inherited.supersededDecisions,
+    deprecatedInvariants: inherited.deprecatedInvariants,
     openQuestions: Array.isArray(input.openQuestions) ? input.openQuestions : [],
-    verification: Array.isArray(input.verification) ? input.verification : [],
+    verification: inherited.verification,
     boardDigest,
     contextDigest,
     evidence: Array.isArray(input.evidence) ? input.evidence : [],
-    acceptanceCriteria: Array.isArray(input.acceptanceCriteria) ? input.acceptanceCriteria : [],
+    acceptanceCriteria: inherited.acceptanceCriteria,
     returnContract:
       input.returnContract ??
       "Return concise summary, files touched, exact verification commands/outputs, and blockers or open risks.",
@@ -193,26 +359,16 @@ export function loadHandoffPacket(cwd, handoffId) {
 }
 
 /**
- * Render Handoff Packet in Prefix-Cache-friendly order:
- * Static contract & scope + Tier-1 pinned invariants/decisions FIRST,
- * task goal & acceptance criteria MIDDLE, dynamic board/context/evidence LAST.
+ * Render Handoff Packet starting at BYTE 0 with turn-invariant policy, scope, and
+ * pinned workflow constraints so LLM prompt prefix caches match from the very first token.
+ * Dynamic per-turn handoff IDs, timestamps, goals, board digests, and evidence appear after `---`.
  */
 export function renderHandoffMarkdown(packet) {
   const lines = [
-    `<HANDOFF_PACKET id="${packet.handoffId}" fromHost="${packet.fromHost || packet.fromEngine}" from="${packet.fromEngine}" to="${packet.toEngine}" role="${packet.role}">`,
-    `Workflow: ${packet.workflowId}`,
+    `<HANDOFF_CONTRACT workflow="${packet.workflowId}">`,
     `Return Contract: ${packet.returnContract}`
   ];
 
-  if (packet.scope?.worktreePath) {
-    lines.push(`Working Directory (Isolated Worktree): ${packet.scope.worktreePath}`);
-  }
-  if (packet.scope?.branch || packet.scope?.headSha) {
-    lines.push(`Git Base: ${packet.scope.branch ?? "detached"} @ ${packet.scope.headSha ?? "unknown"}`);
-  }
-  if (packet.scope?.ownedFiles?.length) {
-    lines.push(`Owned Files (you may edit): ${packet.scope.ownedFiles.join(", ")}`);
-  }
   if (packet.scope?.forbiddenFiles?.length) {
     lines.push(`Forbidden Files (DO NOT edit): ${packet.scope.forbiddenFiles.join(", ")}`);
   }
@@ -229,12 +385,28 @@ export function renderHandoffMarkdown(packet) {
     for (const dnr of packet.doNotRelitigate) lines.push(`- ${dnr}`);
   }
 
+  lines.push("---");
+  lines.push(
+    `<HANDOFF_TURN id="${packet.handoffId}" parent="${packet.parentHandoffId ?? "none"}" version="${packet.decisionVersion ?? 1}" fromHost="${packet.fromHost || packet.fromEngine}" from="${packet.fromEngine}" to="${packet.toEngine}" role="${packet.role}">`
+  );
+  if (packet.scope?.ownedFiles?.length) {
+    lines.push(`Owned Files (you may edit): ${packet.scope.ownedFiles.join(", ")}`);
+  }
+  if (packet.scope?.worktreePath) {
+    lines.push(`Working Directory (Isolated Worktree): ${packet.scope.worktreePath}`);
+  }
+  if (packet.scope?.branch || packet.scope?.headSha) {
+    lines.push(`Git Base: ${packet.scope.branch ?? "detached"} @ ${packet.scope.headSha ?? "unknown"}`);
+  }
   lines.push(`Goal: ${packet.goal}`);
   if (packet.acceptanceCriteria?.length) {
     lines.push("Acceptance Criteria:");
     for (const ac of packet.acceptanceCriteria) lines.push(`- ${ac}`);
   }
-
+  if (packet.supersededDecisions?.length) {
+    lines.push("Superseded Decisions (Do NOT use):");
+    for (const sup of packet.supersededDecisions) lines.push(`- ${sup}`);
+  }
   if (packet.boardDigest) {
     lines.push("Board Continuity (Tiered):");
     lines.push(packet.boardDigest);
@@ -257,7 +429,7 @@ export function renderHandoffMarkdown(packet) {
     lines.push("Open Questions:");
     for (const q of packet.openQuestions) lines.push(`- ${q}`);
   }
-  lines.push("</HANDOFF_PACKET>");
+  lines.push("</HANDOFF_TURN>");
   return lines.join("\n");
 }
 
@@ -272,8 +444,12 @@ export function buildWorkerResultToHandoff(cwd, workerResult, nextSpec = {}) {
   if (workerResult.patchPath) {
     evidence.push(`Patch file: ${workerResult.patchPath}`);
   }
+  if (workerResult.ignoredOnlyDeliverables && workerResult.ignoredFiles?.length) {
+    evidence.push(`Ignored deliverables in worktree: ${workerResult.ignoredFiles.join(", ")}`);
+  }
   return createHandoffPacket(cwd, {
-    parentHandoffId: workerResult.handoffId ?? null,
+    parentHandoffId: nextSpec.parentHandoffId ?? workerResult.handoffId ?? null,
+    inheritParent: nextSpec.inheritParent !== false,
     workflowId: nextSpec.workflowId ?? workerResult.workflowId ?? "default",
     boardId: nextSpec.boardId ?? workerResult.boardId ?? null,
     includeBoardDigest: Boolean(nextSpec.includeBoardDigest),
@@ -285,6 +461,10 @@ export function buildWorkerResultToHandoff(cwd, workerResult, nextSpec = {}) {
     ownedFiles: nextSpec.ownedFiles ?? [],
     forbiddenFiles: nextSpec.forbiddenFiles ?? ["docs/handoff.md"],
     invariants: nextSpec.invariants ?? [],
+    decisionsMade: nextSpec.decisionsMade ?? [],
+    doNotRelitigate: nextSpec.doNotRelitigate ?? [],
+    supersededDecisions: nextSpec.supersededDecisions ?? [],
+    deprecatedInvariants: nextSpec.deprecatedInvariants ?? [],
     evidence,
     acceptanceCriteria: nextSpec.acceptanceCriteria ?? [],
     claudeSessionId: workerResult.engine === "claude" ? workerResult.sessionId : null,
