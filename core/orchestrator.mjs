@@ -1713,13 +1713,13 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
         `\nProblem:\n${question}`
       ].join("\n");
       const resolvedPhase1 = modelSpecs.map((spec, idx) => {
-        const route = resolveRoute({ spec, host, prompt: phase1Prompt, mode: "readonly" });
+        const route = resolveRoute({ spec, host, prompt: phase1Prompt, mode: "readonly", excludeHost: true });
         if (route.fanout) {
           throw new Error(
             `Profile "${route.profile}" is a fan-out profile and cannot be assigned to an individual worker.`
           );
         }
-        return { spec: spec || route.primary.spec, idx, route };
+        return { spec, idx, route };
       });
       const phase1Promises = resolvedPhase1.map(({ spec, idx, route }) =>
         pool.run(route.primary.engine, () =>

@@ -2325,16 +2325,18 @@ async function testReleaseGateStateConsistencySuite() {
     }
   }
 
-  // R22: Default 8500B MCP budget must NOT truncate _recall when workspace cwd path is long
+  // R22: Default 8500B MCP budget must NOT truncate _recall even in Pass 3 minimal summary with >1KB cwd
   {
     const longCwd = `/tmp/${"workspace-segment-".repeat(8)}project`;
-    const bigReview = {
+    const deepCwd = `/tmp/${"nested-path-".repeat(90)}repo`;
+    assert.ok(Buffer.byteLength(deepCwd, "utf8") > 1050);
+    const makeBigReview = (count) => ({
       ok: false,
       reviewId: "rev-long-cwd-test",
       verdict: "needs-attention",
-      blockingCount: 12,
-      totalFindings: 12,
-      findings: Array.from({ length: 12 }, (_, idx) => ({
+      blockingCount: count,
+      totalFindings: count,
+      findings: Array.from({ length: count }, (_, idx) => ({
         id: `F${idx + 1}`,
         severity: "blocking",
         file: `src/mod-${idx}.js`,
@@ -2343,15 +2345,25 @@ async function testReleaseGateStateConsistencySuite() {
         trigger_path: `step(${idx})`,
         body: "Narrative ".repeat(120)
       }))
-    };
-    const compactedLongCwd = JSON.parse(serializeMcpPayload("relay_review", bigReview, { maxBytes: 8500, cwd: longCwd }).text);
-    assert.equal(compactedLongCwd._compacted, true);
-    assert.equal(compactedLongCwd._recall.includes("[TRUNCATED"), false, "_recall must not truncate at default 8500B budget");
-    assert.ok(compactedLongCwd._recall.includes(longCwd), "_recall must retain full long cwd");
-    assert.ok(compactedLongCwd._recall.includes("limit=10"), "_recall must retain full inspect arguments");
+    });
+    for (const [count, cwdVal] of [
+      [12, longCwd],
+      [48, deepCwd]
+    ]) {
+      const serialized = serializeMcpPayload("relay_review", makeBigReview(count), { maxBytes: 8500, cwd: cwdVal });
+      assert.ok(serialized.bytes <= 8500, `Compacted review must stay <= 8500B, got ${serialized.bytes}`);
+      const compactedLongCwd = JSON.parse(serialized.text);
+      assert.equal(compactedLongCwd._compacted, true);
+      if (count === 48) {
+        assert.equal(Object.hasOwn(compactedLongCwd, "findings"), false, "48 findings must exercise Pass 3 buildMinimalSummary");
+      }
+      assert.equal(compactedLongCwd._recall.includes("[TRUNCATED"), false, `_recall must not truncate (count=${count})`);
+      assert.ok(compactedLongCwd._recall.includes(cwdVal), `_recall must retain full cwd (count=${count})`);
+      assert.ok(compactedLongCwd._recall.includes("limit=10"), `_recall must retain full inspect args (count=${count})`);
+    }
   }
 
-  // R23: boost rejects fan-out profile triggered by phase1Prompt heuristic on empty spec BEFORE dispatching sibling 0
+  // R23: boost rejects fan-out profile on empty spec pre-flight AND preserves route.fallback when empty spec runs normally
   {
     const r23ConfigDir = path.join(TMP_BASE, "r23-config");
     fs.mkdirSync(r23ConfigDir, { recursive: true });
@@ -2379,6 +2391,33 @@ async function testReleaseGateStateConsistencySuite() {
     }
     const afterR23Lines = fs.existsSync(RECORD_FILE) ? fs.readFileSync(RECORD_FILE, "utf8").split("\n").filter(Boolean).length : 0;
     assert.equal(afterR23Lines, beforeR23Lines, "Prompt-routed fanout profile on empty spec must reject before starting sibling 0");
+
+    // Verify empty spec in boost retains profile fallback when primary hits pre-dispatch failure
+    const fakeCodex429 = path.join(TMP_BASE, "fake-codex-429");
+    fs.writeFileSync(
+      fakeCodex429,
+      [
+        "#!/usr/bin/env node",
+        "console.error('429 rate limit exceeded');",
+        "process.exit(1);"
+      ].join("\n"),
+      { mode: 0o755 }
+    );
+    const prevCodexBinR23 = process.env.TRIRELAY_CODEX_BIN;
+    process.env.TRIRELAY_CODEX_BIN = fakeCodex429;
+    try {
+      const fbBoost = await runOrchestration(REPO_DIR, {
+        pattern: "boost",
+        host: "agy",
+        prompt: "Analyze consistency risk",
+        models: [""]
+      });
+      assert.equal(fbBoost.ok, true, "boost empty spec must retain pre-dispatch fallback when primary fails before dispatch");
+      assert.equal(fbBoost.perspectives[0].engine, "claude");
+    } finally {
+      if (prevCodexBinR23 !== undefined) process.env.TRIRELAY_CODEX_BIN = prevCodexBinR23;
+      else delete process.env.TRIRELAY_CODEX_BIN;
+    }
   }
 
   console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables, R8-R23 audit hardening)");
