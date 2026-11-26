@@ -100,8 +100,9 @@ export function formatBoardStub(post, maxSummaryChars = 120) {
  */
 export function buildTieredBoardView(
   posts = [],
-  { pinnedPosts = null, recentFull = 3, maxStubChars = 120, maxBytes = 2400, boardId = "default" } = {}
+  { pinnedPosts = null, recentFull = 3, maxStubChars = 120, maxBytes = 2400, boardId = "default", cwd = null } = {}
 ) {
+  const cwdPrefix = cwd ? `cwd=${JSON.stringify(cwd)}, ` : "";
   const rawPosts = Array.isArray(posts) ? posts : [];
   const activePins = Array.isArray(pinnedPosts) ? pinnedPosts.filter((p) => p && (p.status == null || p.status === "active")) : [];
   const activePinSeqs = new Set(activePins.map((p) => p.seq).filter((s) => s != null));
@@ -136,7 +137,7 @@ export function buildTieredBoardView(
       omittedPinnedSeqs: [],
       truncatedPinnedSeqs: [],
       posts: [],
-      recallHint: `relay_board(action="read", boardId="${boardId}", view="full")`
+      recallHint: `relay_board(action="read", ${cwdPrefix}boardId="${boardId}", view="full")`
     };
   }
 
@@ -259,8 +260,10 @@ export function buildTieredBoardView(
   const needExactPinRecall = omittedPinnedSeqs.length > 0 || truncatedArr.length > 0;
   const targetSeqs = [...new Set([...omittedPinnedSeqs, ...truncatedArr])];
   const recallHint = needExactPinRecall
-    ? `relay_board(action="read", boardId="${boardId}", view="full", pinsOnly=true${targetSeqs.length ? `, seqs=${JSON.stringify(targetSeqs)}` : ""})`
-    : `relay_board(action="read", boardId="${boardId}", view="full")`;
+    ? targetSeqs.length > 0
+      ? `relay_board(action="read", ${cwdPrefix}boardId="${boardId}", seqs=${JSON.stringify(targetSeqs)})`
+      : `relay_board(action="read", ${cwdPrefix}boardId="${boardId}", view="full", pinsOnly=true)`
+    : `relay_board(action="read", ${cwdPrefix}boardId="${boardId}", view="full")`;
 
   return {
     view: "tiered",
@@ -309,21 +312,23 @@ function unwrapJobPayload(payload) {
   return payload;
 }
 
-function buildRecallPointer(toolName, payload) {
+function buildRecallPointer(toolName, payload, { cwd = null } = {}) {
   const view = unwrapJobPayload(payload);
+  const targetCwd = cwd || view?.cwd || view?.workspaceRoot || payload?.cwd || payload?.workspaceRoot || null;
+  const cwdPrefix = targetCwd ? `cwd=${JSON.stringify(targetCwd)}, ` : "";
   if (view?.reviewId) {
-    return `relay_review(action="inspect", reviewId="${view.reviewId}", offset=0, limit=10)`;
+    return `relay_review(action="inspect", ${cwdPrefix}reviewId="${view.reviewId}", offset=0, limit=10)`;
   }
   const jobId = view?.jobId || view?.job?.id || view?.id;
   if (jobId) {
-    return `relay_jobs(action="result", jobId="${jobId}", compact=false)`;
+    return `relay_jobs(action="result", ${cwdPrefix}jobId="${jobId}", compact=false)`;
   }
   if (view?.handoffId || view?.packet?.handoffId) {
     const hid = view?.handoffId || view?.packet?.handoffId;
-    return `relay_handoff(action="inspect", handoffId="${hid}")`;
+    return `relay_handoff(action="inspect", ${cwdPrefix}handoffId="${hid}")`;
   }
   if (view?.boardId) {
-    return `relay_board(action="read", boardId="${view.boardId}", view="full")`;
+    return `relay_board(action="read", ${cwdPrefix}boardId="${view.boardId}", view="full")`;
   }
   return toolName ? `Inspect local job/artifact records for ${toolName} directly.` : "Inspect artifact paths directly.";
 }
@@ -384,9 +389,9 @@ function buildBlockingPreview(payload, maxItems = 6) {
   }));
 }
 
-function buildMinimalSummary(toolName, payload, originalBytes, maxBytes) {
+function buildMinimalSummary(toolName, payload, originalBytes, maxBytes, { cwd = null } = {}) {
   const view = unwrapJobPayload(payload);
-  const recallFull = buildRecallPointer(toolName, view);
+  const recallFull = buildRecallPointer(toolName, view, { cwd });
   const rawJobId = view?.jobId || view?.job?.id || view?.id || null;
   const rawHandoffId = view?.handoffId || view?.packet?.handoffId || null;
   const rawPatchPath = view?.patchPath || view?.job?.patchPath || null;
@@ -519,11 +524,11 @@ function buildMinimalSummary(toolName, payload, originalBytes, maxBytes) {
   return { _compacted: true };
 }
 
-function decorateCompactedMetadata(target, toolName, payload, originalBytes, preview1) {
+function decorateCompactedMetadata(target, toolName, payload, originalBytes, preview1, { cwd = null } = {}) {
   const view = unwrapJobPayload(payload);
   target._compacted = true;
   target._originalBytes = originalBytes;
-  target._recall = buildRecallPointer(toolName, payload);
+  target._recall = buildRecallPointer(toolName, payload, { cwd });
   if (view && view !== payload) {
     if (view.reviewId && target.reviewId === undefined) target.reviewId = view.reviewId;
     if (view.decision && target.decision === undefined) target.decision = view.decision;
@@ -541,7 +546,7 @@ function decorateCompactedMetadata(target, toolName, payload, originalBytes, pre
   return target;
 }
 
-export function compactMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxBytes(), enabled = true } = {}) {
+export function compactMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxBytes(), enabled = true, cwd = null } = {}) {
   if (!enabled || payload == null || typeof payload !== "object") {
     return payload;
   }
@@ -561,7 +566,8 @@ export function compactMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxB
     toolName,
     payload,
     originalBytes,
-    preview1
+    preview1,
+    { cwd }
   );
   if (Buffer.byteLength(JSON.stringify(pass1), "utf8") <= budget) {
     return pass1;
@@ -573,10 +579,11 @@ export function compactMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxB
     toolName,
     payload,
     originalBytes,
-    preview1
+    preview1,
+    { cwd }
   );
   if (Array.isArray(pass2.posts) && pass2.posts.length > 6) {
-    pass2.posts = buildTieredBoardView(pass2.posts, { recentFull: 2, maxBytes: Math.floor(budget * 0.45) }).posts;
+    pass2.posts = buildTieredBoardView(pass2.posts, { recentFull: 2, maxBytes: Math.floor(budget * 0.45), cwd }).posts;
   }
   if (Buffer.byteLength(JSON.stringify(pass2), "utf8") <= budget) {
     return pass2;
@@ -589,10 +596,10 @@ export function compactMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxB
   }
 
   // Pass 3: guaranteed-bounded summary preserving reviewId, blockingPreview & exact recall pointer.
-  return buildMinimalSummary(toolName, payload, originalBytes, budget);
+  return buildMinimalSummary(toolName, payload, originalBytes, budget, { cwd });
 }
 
-export function serializeMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxBytes(), compact = true } = {}) {
+export function serializeMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxBytes(), compact = true, cwd = null } = {}) {
   if (!compact || payload == null || typeof payload !== "object") {
     const text = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
     return { text, compacted: false, bytes: Buffer.byteLength(text, "utf8") };
@@ -609,7 +616,7 @@ export function serializeMcpPayload(toolName, payload, { maxBytes = resolveMcpMa
     return { text: compactRaw, compacted: false, bytes: Buffer.byteLength(compactRaw, "utf8") };
   }
 
-  const compactedObj = compactMcpPayload(toolName, payload, { maxBytes: budget, enabled: true });
+  const compactedObj = compactMcpPayload(toolName, payload, { maxBytes: budget, enabled: true, cwd });
   const text = JSON.stringify(compactedObj);
   return {
     text,

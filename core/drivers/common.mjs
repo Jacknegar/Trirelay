@@ -60,7 +60,7 @@ export function spawnJsonlProcess({
   onLine = null,
   onStderr = null
 }) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const useProcessGroup = process.platform !== "win32";
     const graceMs = Math.max(100, Math.min(3000, Number.isFinite(Number(killGraceMs)) ? Number(killGraceMs) : 1500));
     const env = buildWorkerEnv(process.env, {
@@ -87,6 +87,7 @@ export function spawnJsonlProcess({
     let terminating = false;
     let sweepingGroup = false;
     let settled = false;
+    let callbackError = null;
     let forceKillTimer = null;
     let exitDrainTimer = null;
     let groupPollTimer = null;
@@ -137,13 +138,27 @@ export function spawnJsonlProcess({
       if (signal) signal.removeEventListener("abort", onAbort);
     }
 
+    function invokeCallback(fn, arg) {
+      if (!fn || callbackError) return;
+      try {
+        fn(arg);
+      } catch (err) {
+        callbackError = err;
+        terminateTree({ markTerminating: true });
+      }
+    }
+
     function finalize(codeOverride = undefined) {
       if (settled) return;
       settled = true;
       cleanup(false);
       const tail = stdoutBuf.trim();
       if (tail) {
-        onLine?.(tail);
+        invokeCallback(onLine, tail);
+      }
+      if (callbackError) {
+        reject(callbackError);
+        return;
       }
       resolve({
         code: codeOverride !== undefined ? codeOverride : exitCode,
@@ -246,7 +261,7 @@ export function spawnJsonlProcess({
         const line = stdoutBuf.slice(0, idx).trim();
         stdoutBuf = stdoutBuf.slice(idx + 1);
         if (line) {
-          onLine?.(line);
+          invokeCallback(onLine, line);
         }
         idx = stdoutBuf.indexOf("\n");
       }
@@ -254,7 +269,7 @@ export function spawnJsonlProcess({
 
     proc.stderr.on("data", (chunk) => {
       stderr += chunk;
-      onStderr?.(chunk);
+      invokeCallback(onStderr, chunk);
     });
 
     function maybeSettleCleanExit(code = exitCode) {

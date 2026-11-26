@@ -190,7 +190,18 @@ export async function handleJobControl(cwd, args = {}) {
     const waitMs = Math.max(500, Math.min(90000, Number(args.waitTimeoutMs ?? 30000)));
     const active = activeInProcessJobs.get(args.jobId);
     if (active) {
-      await Promise.race([active.promise, new Promise((r) => setTimeout(r, waitMs))]);
+      let waitTimer = null;
+      try {
+        await Promise.race([
+          active.promise,
+          new Promise((r) => {
+            waitTimer = setTimeout(r, waitMs);
+            waitTimer.unref?.();
+          })
+        ]);
+      } finally {
+        if (waitTimer) clearTimeout(waitTimer);
+      }
     } else {
       const deadline = Date.now() + waitMs;
       while (Date.now() < deadline) {

@@ -98,8 +98,11 @@ export function createIsolatedWorktree(repoRoot, { id = null, branch = null, bas
 }
 
 function matchPathRule(filePath, rule) {
-  const normFile = filePath.replace(/\\/g, "/").replace(/^\.\//, "");
-  const normRule = String(rule || "").replace(/\\/g, "/").replace(/^\.\//, "").trim();
+  const isWin = process.platform === "win32";
+  const rawFile = String(filePath || "");
+  const normFile = (isWin ? rawFile.replace(/\\/g, "/") : rawFile).replace(/^\.\//, "");
+  const rawRule = String(rule || "");
+  const normRule = (isWin ? rawRule.replace(/\\/g, "/") : rawRule).replace(/^\.\//, "").trim();
   if (!normRule) return false;
   if (normRule.endsWith("/**")) {
     const prefix = normRule.slice(0, -3);

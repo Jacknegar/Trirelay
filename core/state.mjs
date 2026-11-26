@@ -135,6 +135,13 @@ export function loadSessionLedger(cwd) {
   return readJsonSafe(sessionLedgerPath(cwd), { entries: {}, bySession: {}, leases: {} });
 }
 
+function entryWritePriority(entry) {
+  if (!entry) return 0;
+  if (entry.hadWorktree === true) return 2;
+  if (entry.hadWorktree === undefined) return 1;
+  return 0;
+}
+
 export function recordRoleSession(
   cwd,
   {
@@ -171,16 +178,18 @@ export function recordRoleSession(
       const legacyMatches = Object.values(ledger.entries)
         .filter((e) => e && e.engine === engine && e.sessionId === sessionId)
         .sort((a, b) => {
-          const hwDiff = (b.hadWorktree ? 1 : 0) - (a.hadWorktree ? 1 : 0);
+          const hwDiff = entryWritePriority(b) - entryWritePriority(a);
           return hwDiff !== 0 ? hwDiff : String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? ""));
         });
       existingById = legacyMatches[0] || null;
     }
 
     // Never inherit worktree/patch bindings from a DIFFERENT sessionId under the same key.
-    // On a non-write (readonly) run, preserve existing worktree binding only if it belongs
-    // to this exact (engine, sessionId) so cross-role resume never strips write state.
-    const preserveExistingWrite = !isWriteRun && Boolean(existingById?.hadWorktree);
+    // On a non-write (readonly) run, preserve existing worktree binding (or legacy unknown status)
+    // only if it belongs to this exact (engine, sessionId) so cross-role resume never strips write state.
+    const preserveExistingWrite = !isWriteRun && existingById?.hadWorktree === true;
+    const preserveLegacyUnknown = !isWriteRun && Boolean(existingById) && existingById.hadWorktree === undefined;
+    const preserveAnyWriteState = preserveExistingWrite || preserveLegacyUnknown;
     const resolvedEntry = {
       workflowId,
       role,
@@ -189,15 +198,18 @@ export function recordRoleSession(
       sessionCwd,
       model,
       effort,
-      worktreeId: isWriteRun ? worktreeId ?? existingById?.worktreeId ?? null : preserveExistingWrite ? existingById.worktreeId ?? null : null,
-      worktreePath: isWriteRun ? worktreePath ?? null : preserveExistingWrite ? existingById.worktreePath ?? null : null,
-      baseSha: isWriteRun ? baseSha ?? existingById?.baseSha ?? null : preserveExistingWrite ? existingById.baseSha ?? null : null,
-      patchPath: isWriteRun ? patchPath ?? null : preserveExistingWrite ? existingById.patchPath ?? null : null,
-      patchSha256: isWriteRun ? patchSha256 ?? null : preserveExistingWrite ? existingById.patchSha256 ?? null : null,
-      deliverableMode: isWriteRun ? deliverableMode ?? null : preserveExistingWrite ? existingById.deliverableMode ?? null : null,
-      finalHeadSha: isWriteRun ? finalHeadSha ?? null : preserveExistingWrite ? existingById.finalHeadSha ?? null : null,
-      captureComplete: isWriteRun ? Boolean(captureComplete) : preserveExistingWrite ? existingById.captureComplete !== false : true,
-      hadWorktree: Boolean(isWriteRun || preserveExistingWrite),
+      worktreeId: isWriteRun ? worktreeId ?? existingById?.worktreeId ?? null : preserveAnyWriteState ? existingById.worktreeId ?? null : null,
+      worktreePath: isWriteRun ? worktreePath ?? null : preserveAnyWriteState ? existingById.worktreePath ?? null : null,
+      ...(preserveLegacyUnknown && !existingById?.worktreePath && (existingById?.legacySessionCwd || existingById?.sessionCwd)
+        ? { legacySessionCwd: existingById.legacySessionCwd ?? existingById.sessionCwd }
+        : {}),
+      baseSha: isWriteRun ? baseSha ?? existingById?.baseSha ?? null : preserveAnyWriteState ? existingById.baseSha ?? null : null,
+      patchPath: isWriteRun ? patchPath ?? null : preserveAnyWriteState ? existingById.patchPath ?? null : null,
+      patchSha256: isWriteRun ? patchSha256 ?? null : preserveAnyWriteState ? existingById.patchSha256 ?? null : null,
+      deliverableMode: isWriteRun ? deliverableMode ?? null : preserveAnyWriteState ? existingById.deliverableMode ?? null : null,
+      finalHeadSha: isWriteRun ? finalHeadSha ?? null : preserveAnyWriteState ? existingById.finalHeadSha ?? null : null,
+      captureComplete: isWriteRun ? Boolean(captureComplete) : preserveAnyWriteState ? existingById.captureComplete !== false : true,
+      ...(preserveLegacyUnknown ? {} : { hadWorktree: Boolean(isWriteRun || preserveExistingWrite) }),
       updatedAt: nowIso()
     };
 
@@ -232,7 +244,7 @@ export function lookupSessionById(cwd, { engine, sessionId }) {
   const matches = Object.values(ledger.entries ?? {})
     .filter((entry) => entry && entry.engine === engine && entry.sessionId === sessionId)
     .sort((a, b) => {
-      const hwDiff = (b.hadWorktree ? 1 : 0) - (a.hadWorktree ? 1 : 0);
+      const hwDiff = entryWritePriority(b) - entryWritePriority(a);
       return hwDiff !== 0 ? hwDiff : String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? ""));
     });
   return matches[0] ?? null;

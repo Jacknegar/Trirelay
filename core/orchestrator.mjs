@@ -363,19 +363,24 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
 
   try {
     if (useWorktree) {
-      if (resumeSessionId && sessionEntry?.hadWorktree) {
+      if (resumeSessionId && sessionEntry && sessionEntry.hadWorktree !== false) {
+        const boundWorktreePath =
+          sessionEntry.worktreePath ||
+          (sessionEntry.hadWorktree === undefined
+            ? sessionEntry.legacySessionCwd || sessionEntry.sessionCwd || null
+            : null);
         const canReuseOriginal =
           !willFork &&
-          sessionEntry.worktreePath &&
-          isInsideManagedWorktree(sessionEntry.worktreePath) &&
-          fs.existsSync(sessionEntry.worktreePath) &&
-          isGitRepo(sessionEntry.worktreePath);
+          boundWorktreePath &&
+          isInsideManagedWorktree(boundWorktreePath) &&
+          fs.existsSync(boundWorktreePath) &&
+          isGitRepo(boundWorktreePath);
 
         if (canReuseOriginal) {
           worktree = {
-            worktreeId: sessionEntry.worktreeId || path.basename(sessionEntry.worktreePath),
+            worktreeId: sessionEntry.worktreeId || path.basename(boundWorktreePath),
             repoRoot: workspaceRoot,
-            worktreePath: sessionEntry.worktreePath,
+            worktreePath: boundWorktreePath,
             branch: null,
             baseSha: sessionEntry.baseSha || getGitHeadSha(workspaceRoot),
             reused: true
@@ -411,7 +416,7 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
           appendJobLog(logFile, `Created clean resume worktree at base=${sessionEntry.baseSha} (no prior patch)`);
         } else {
           throw new Error(
-            `Cannot resume write session "${resumeSessionId}": bound worktree (${sessionEntry.worktreePath || "none"}) and patch (${sessionEntry.patchPath || "none"}) are unavailable; start a fresh session or apply prior changes first.`
+            `Cannot resume write session "${resumeSessionId}": bound worktree (${boundWorktreePath || "none"}) and patch (${sessionEntry.patchPath || "none"}) are unavailable; start a fresh session or apply prior changes first.`
           );
         }
       } else {
@@ -522,7 +527,13 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
       }
     }
 
-    const onProgress = (msg) => appendJobLog(logFile, msg);
+    const onProgress = (msg) => {
+      try {
+        appendJobLog(logFile, msg);
+      } catch {
+        // Progress logs are best-effort; disk/stream write errors must not crash active worker processes.
+      }
+    };
     const candidates = [route.primary, ...(params.allowFallback === false ? [] : route.fallback)];
     let finalResult = null;
     let usedTarget = route.primary;
@@ -956,6 +967,7 @@ export function inspectReviewArtifact(cwd, { reviewId, offset = 0, limit = 10, s
   const hasMore = nextOffset < filtered.length;
   return {
     ok: true,
+    workspaceRoot,
     reviewId: safeId,
     verdict: artifact.verdict,
     decision: artifact.decision ?? null,
@@ -973,7 +985,7 @@ export function inspectReviewArtifact(cwd, { reviewId, offset = 0, limit = 10, s
     hasMore,
     findings: page,
     ...(hasMore
-      ? { nextRecall: `relay_review(action="inspect", reviewId="${safeId}", offset=${nextOffset}, limit=${safeLimit}${severity ? `, severity="${severity}"` : ""})` }
+      ? { nextRecall: `relay_review(action="inspect", cwd=${JSON.stringify(workspaceRoot)}, reviewId="${safeId}", offset=${nextOffset}, limit=${safeLimit}${severity ? `, severity="${severity}"` : ""})` }
       : {})
   };
 }
@@ -1175,7 +1187,7 @@ export async function runDualReview(cwd, params = {}, internalOpts = {}) {
     }))
   };
   const artifactPath = saveReviewArtifact(workspaceRoot, reviewId, payload);
-  return { ...payload, artifactPath };
+  return { ...payload, workspaceRoot, artifactPath };
 }
 
 export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
@@ -1291,6 +1303,7 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
     const lastEntry = reservation.lastEntry ?? {};
     return {
       ok: false,
+      workspaceRoot,
       reviewId: lastEntry.reviewId ?? null,
       artifactPath: lastEntry.artifactPath ?? null,
       gateKey,
@@ -1359,8 +1372,12 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
       );
 
       // Compare-and-set on cycleId: ignore stale late completions if a newer cycle
-      // started or if the target cycle has already passed.
-      if (latest.cycleId !== reservation.cycleId || latest.status === "passed") {
+      // started, if the target cycle has already passed, or if a newer counted
+      // review already completed in this cycle so an older approval cannot override it.
+      const hasNewerCounted = (latest.history ?? []).some(
+        (h) => h && h.counted !== false && (h.seq ?? h.round ?? 0) > reservation.seq
+      );
+      if (latest.cycleId !== reservation.cycleId || latest.status === "passed" || (decision === "pass" && hasNewerCounted)) {
         save({ ...latest, pendingReservations: remainingPending });
         staleCompletion = true;
         tokenRetired = true;
@@ -1388,12 +1405,13 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
       const countedEntries = rawHistory.filter((h) => h.counted !== false);
       const incompleteEntries = rawHistory.filter((h) => h.counted === false).slice(-10);
       const history = [...countedEntries, ...incompleteEntries].sort((a, b) => (a.seq ?? a.round ?? 0) - (b.seq ?? b.round ?? 0));
+      const latestCounted = countedEntries[countedEntries.length - 1] ?? null;
 
       save({
         gateKey,
         cycleId: reservation.cycleId,
         cycleNumber: reservation.cycleNumber,
-        status: decision === "pass" ? "passed" : "open",
+        status: latestCounted?.decision === "pass" ? "passed" : "open",
         round: countedEntries.length,
         nextAttemptSeq: Math.max(Number(latest.nextAttemptSeq || 0), reservation.seq),
         pendingReservations: remainingPending,
@@ -1419,6 +1437,7 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
 
   return {
     ok: decision === "pass" && !staleCompletion,
+    workspaceRoot,
     staleCompletion,
     reviewId: review.reviewId,
     artifactPath: review.artifactPath,
@@ -1688,11 +1707,15 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
     let phase1Results = [];
     let critiques = [];
     try {
-      const resolvedPhase1 = modelSpecs.map((spec, idx) => ({
-        spec,
-        idx,
-        route: resolveRoute({ spec, host })
-      }));
+      const resolvedPhase1 = modelSpecs.map((spec, idx) => {
+        const route = resolveRoute({ spec, host });
+        if (route.fanout) {
+          throw new Error(
+            `Profile "${route.profile}" is a fan-out profile and cannot be assigned to an individual worker.`
+          );
+        }
+        return { spec, idx, route };
+      });
       const phase1Promises = resolvedPhase1.map(({ spec, idx, route }) =>
         pool.run(route.primary.engine, () =>
           runSingleTask(
@@ -1913,6 +1936,24 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
       }
     }
 
+    for (const w of byName.values()) {
+      const preflightRoute = resolveRoute({
+        profile: w.profile || (w.mode === "write" ? "swarm-worker" : "explorer"),
+        spec: w.spec,
+        engine: w.engine,
+        model: w.model,
+        effort: w.effort,
+        prompt: w.prompt,
+        mode: w.mode ?? "readonly",
+        host
+      });
+      if (preflightRoute.fanout) {
+        throw new Error(
+          `Profile "${preflightRoute.profile}" is a fan-out profile and cannot be assigned to swarm worker "${w.name}".`
+        );
+      }
+    }
+
     const completed = new Map();
     const remaining = new Set(byName.keys());
 
@@ -1955,6 +1996,11 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
             mode,
             host
           });
+          if (route.fanout) {
+            throw new Error(
+              `Profile "${route.profile}" is a fan-out profile and cannot be assigned to swarm worker "${name}".`
+            );
+          }
           return { name, w, blocked: false, depEvidence, profile, mode, route };
         });
 
@@ -2131,6 +2177,11 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
       mode,
       host
     });
+    if (route.fanout) {
+      throw new Error(
+        `Profile "${route.profile}" is a fan-out profile and cannot be assigned to teamwork worker "${role}".`
+      );
+    }
     return { task, role, mode, profile, route };
   });
 
@@ -2228,8 +2279,17 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
   }
 
   const workersAccepted = workerResults.every((r) => r.ok && r.structuredOutput?.status !== "blocked");
+  const verifierFindings = Array.isArray(verificationResult?.structuredOutput?.findings)
+    ? verificationResult.structuredOutput.findings
+    : [];
+  const verifierHasBlocking = verifierFindings.some((f) => isBlockingSeverity(f?.severity));
   const verifierAccepted = verificationResult
-    ? Boolean(verificationResult.ok && verificationResult.structuredOutput?.verdict === "approve")
+    ? Boolean(
+        verificationResult.ok &&
+          isValidReviewPayload(verificationResult.structuredOutput) &&
+          verificationResult.structuredOutput.verdict === "approve" &&
+          !verifierHasBlocking
+      )
     : true;
 
   return {

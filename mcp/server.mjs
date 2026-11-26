@@ -594,11 +594,11 @@ async function handleToolCall(name, args = {}) {
     case "relay_board": {
       const boardId = args.boardId || "default";
       if (args.action === "read") {
-        if (args.pinsOnly) {
-          return { boardId, view: "pinsOnly", pins: readActiveBoardPins(cwd, boardId) };
-        }
         if (Array.isArray(args.seqs) && args.seqs.length > 0) {
           return { boardId, view: "seqs", posts: readBoardPostsBySeqs(cwd, boardId, args.seqs) };
+        }
+        if (args.pinsOnly) {
+          return { boardId, view: "pinsOnly", pins: readActiveBoardPins(cwd, boardId) };
         }
         if (args.view === "full") {
           const fullLimit = args.limit !== undefined ? args.limit : 0;
@@ -607,7 +607,7 @@ async function handleToolCall(name, args = {}) {
         }
         const posts = readBoardPosts(cwd, boardId, { since: args.since ?? 0, limit: args.limit ?? 100 });
         const activePins = readActiveBoardPins(cwd, boardId);
-        return buildTieredBoardView(posts, { pinnedPosts: activePins, boardId });
+        return buildTieredBoardView(posts, { pinnedPosts: activePins, boardId, cwd });
       }
       if (args.action === "post") {
         return postBoardMessage(cwd, boardId, {
@@ -696,9 +696,17 @@ async function handleRequest(msg) {
           ((toolName === "relay_review" || toolName === "relay_review_gate") && (toolArgs.action === "inspect" || Boolean(toolArgs.reviewId))) ||
           (toolName === "relay_handoff" && toolArgs.action === "inspect");
 
+        const recallCwd =
+          payload && typeof payload === "object" && typeof payload.workspaceRoot === "string"
+            ? payload.workspaceRoot
+            : typeof toolArgs.cwd === "string" && toolArgs.cwd.trim()
+              ? resolveWorkspaceRoot(toolArgs.cwd)
+              : null;
+
         const serialized = serializeMcpPayload(toolName, payload, {
           maxBytes: resolveMcpMaxBytes(),
-          compact: !allowUnboundedRecall
+          compact: !allowUnboundedRecall,
+          cwd: recallCwd
         });
 
         sendResponse(id, {

@@ -1326,7 +1326,8 @@ async function testReleaseGateStateConsistencySuite() {
   // Also test honest omission reporting when budget cannot fit all pins
   const tightPins = buildTieredBoardView(recentPostsR5, { pinnedPosts: activePinsR5, boardId: r5BoardId, maxBytes: 420 });
   assert.ok(tightPins.omittedPinnedCount > 0 || tightPins.truncatedPinnedSeqs.length > 0);
-  assert.ok(tightPins.recallHint.includes("pinsOnly=true"));
+  assert.ok(tightPins.recallHint.includes("seqs="));
+  assert.equal(tightPins.recallHint.includes("pinsOnly=true"), false, "Exact seqs recallHint must not combine pinsOnly=true");
   const seq1Lookup = readBoardPostsBySeqs(REPO_DIR, r5BoardId, [1]);
   assert.equal(seq1Lookup.length, 1);
   assert.ok(seq1Lookup[0].text.includes(longPinTail));
@@ -1917,7 +1918,317 @@ async function testReleaseGateStateConsistencySuite() {
     assert.equal(afterFanoutLines, beforeBoostLines, "Invalid sibling route must fail before spawning earlier fan-out workers");
   }
 
-  console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables, R8-R10 sweep/repair/fanout)");
+  // R11: Review-gate older approval A finishing AFTER newer blocking review B cannot close cycle as passed
+  {
+    const r11Gate = `r11-order-${Date.now()}`;
+    delete process.env.TRIRELAY_TEST_REVIEW_BLOCKING;
+    process.env.TRIRELAY_TEST_DELAY_MS = "900";
+    const reqA = runReviewGate(REPO_DIR, { gateKey: r11Gate, engine: "claude", maxRounds: 2 });
+    await new Promise((r) => setTimeout(r, 120));
+    delete process.env.TRIRELAY_TEST_DELAY_MS;
+    process.env.TRIRELAY_TEST_REVIEW_BLOCKING = "1";
+    let resB;
+    let resA;
+    try {
+      resB = await runReviewGate(REPO_DIR, { gateKey: r11Gate, engine: "claude", maxRounds: 2 });
+      resA = await reqA;
+    } finally {
+      delete process.env.TRIRELAY_TEST_REVIEW_BLOCKING;
+      delete process.env.TRIRELAY_TEST_DELAY_MS;
+    }
+    assert.equal(resB.decision, "fix_required");
+    assert.equal(resA.staleCompletion, true, "Older approval completing after newer blocking review must be marked stale");
+    assert.equal(resA.ok, false);
+    const gateAfterR11 = loadReviewGateState(REPO_DIR, r11Gate);
+    assert.equal(gateAfterR11.status, "open", "Older approval must NOT close cycle as passed");
+    assert.equal(gateAfterR11.cycleId, resB.cycleId);
+  }
+
+  // R12: Legacy v1.0 write session without hadWorktree reuses bound managed worktree & fails closed if missing
+  {
+    const wtLegV10 = createIsolatedWorktree(REPO_DIR, { id: `wt-v10-${Date.now()}` });
+    try {
+      fs.writeFileSync(path.join(wtLegV10.worktreePath, "src", "legacy-keep.js"), "export const keep = true;\n");
+      const ledgerPath = sessionLedgerPath(REPO_DIR);
+      const ledgerV10 = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+      delete ledgerV10.bySession["codex::sess-v10-wt"];
+      delete ledgerV10.bySession["codex::sess-v10-gone"];
+      ledgerV10.entries["wf-v10::writer::codex"] = {
+        workflowId: "wf-v10",
+        role: "writer",
+        engine: "codex",
+        sessionId: "sess-v10-wt",
+        sessionCwd: wtLegV10.worktreePath,
+        updatedAt: "2025-12-01T00:00:00.000Z"
+      };
+      ledgerV10.entries["wf-v10-gone::writer::codex"] = {
+        workflowId: "wf-v10-gone",
+        role: "writer",
+        engine: "codex",
+        sessionId: "sess-v10-gone",
+        sessionCwd: REPO_DIR,
+        updatedAt: "2025-12-01T00:00:00.000Z"
+      };
+      writeJsonAtomic(ledgerPath, ledgerV10);
+
+      // Readonly touch must NOT overwrite legacy undefined hadWorktree -> false
+      const roTouch = await runSingleTask(REPO_DIR, {
+        workflowId: "wf-v10",
+        role: "reviewer",
+        engine: "codex",
+        mode: "readonly",
+        resumeSessionId: "sess-v10-wt",
+        prompt: "inspect v1.0 session"
+      });
+      assert.equal(roTouch.ok, true);
+
+      const resumedV10 = await runSingleTask(REPO_DIR, {
+        workflowId: "wf-v10",
+        role: "writer",
+        engine: "codex",
+        mode: "write",
+        resumeRole: true,
+        prompt: "continue in v1.0 worktree"
+      });
+      assert.equal(resumedV10.ok, true);
+      assert.equal(resumedV10.worktreePath, wtLegV10.worktreePath, "Must reuse legacy v1.0 managed worktree");
+      assert.equal(fs.existsSync(path.join(resumedV10.worktreePath, "src", "legacy-keep.js")), true);
+
+      await assert.rejects(
+        () =>
+          runSingleTask(REPO_DIR, {
+            workflowId: "wf-v10-gone",
+            role: "writer",
+            engine: "codex",
+            mode: "write",
+            resumeRole: true,
+            prompt: "must fail closed without silent blank checkout"
+          }),
+        /Cannot resume write session/i
+      );
+    } finally {
+      removeIsolatedWorktree(REPO_DIR, wtLegV10.worktreePath);
+    }
+  }
+
+  // R13: Literal backslash in POSIX filename must NOT match directory ownedFiles rule
+  if (process.platform !== "win32") {
+    const slashViolations = auditFileScope(["src\\pwned.js"], { ownedFiles: ["src/**"] });
+    assert.equal(slashViolations.length, 1, "Literal backslash filename must be rejected by POSIX src/** rule");
+  }
+
+  // R14: Synchronous callback throw inside spawnJsonlProcess rejects cleanly and terminates process group
+  {
+    const throwScript = path.join(TMP_BASE, "callback-throw-child.cjs");
+    const throwPidFile = path.join(TMP_BASE, "callback-throw-desc.pid");
+    fs.writeFileSync(
+      throwScript,
+      [
+        "const fs = require('node:fs');",
+        "const { spawn } = require('node:child_process');",
+        "const d = spawn(process.execPath, ['-e', \"process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)\"], { stdio: ['ignore', 1, 2] });",
+        `fs.writeFileSync(${JSON.stringify(throwPidFile)}, String(d.pid));`,
+        "console.log('TRIGGER_LINE');",
+        "setInterval(() => {}, 1000);"
+      ].join("\n"),
+      { mode: 0o644 }
+    );
+    await assert.rejects(
+      () =>
+        spawnJsonlProcess({
+          bin: process.execPath,
+          args: [throwScript],
+          cwd: REPO_DIR,
+          engine: "codex",
+          timeoutMs: 5000,
+          killGraceMs: 250,
+          onLine: () => {
+            throw new Error("Simulated ENOSPC progress failure");
+          }
+        }),
+      /Simulated ENOSPC progress failure/
+    );
+    const descPid = Number(fs.readFileSync(throwPidFile, "utf8").trim());
+    let descAlive = true;
+    try {
+      process.kill(descPid, 0);
+    } catch (e) {
+      if (e.code === "ESRCH") descAlive = false;
+    }
+    assert.equal(descAlive, false, "Descendant group must be killed when onLine throws");
+  }
+
+  // R15: teamwork must fail when cross-verifier returns verdict='approve' with a blocking finding
+  {
+    const fakeApproveWithBlocker = path.join(TMP_BASE, "fake-claude-approve-blocker");
+    fs.writeFileSync(
+      fakeApproveWithBlocker,
+      [
+        "#!/usr/bin/env node",
+        "const res = {",
+        "  verdict: 'approve',",
+        "  summary: 'Contradictory payload',",
+        "  findings: [{ id: 'B1', severity: 'blocking', file: 'src/a.js', line_start: 1, title: 'Hidden blocker', trigger_path: 'call()', body: 'bad' }],",
+        "  next_steps: []",
+        "};",
+        "console.log(JSON.stringify({ type: 'result', subtype: 'success', session_id: 's-team-block', result: JSON.stringify(res), structured_output: res }));"
+      ].join("\n"),
+      { mode: 0o755 }
+    );
+    const prevClaude = process.env.TRIRELAY_CLAUDE_BIN;
+    try {
+      const teamRes = await (async () => {
+        // Author on codex, explicitly assign claude approve-with-blocker verifier
+        process.env.TRIRELAY_CLAUDE_BIN = fakeApproveWithBlocker;
+        return runOrchestration(REPO_DIR, {
+          pattern: "teamwork",
+          host: "agy",
+          verifierSpec: "claude:haiku",
+          tasks: [{ role: "impl", engine: "codex", mode: "readonly", prompt: "say ok" }]
+        });
+      })();
+      assert.equal(teamRes.ok, false, "Teamwork must reject approve verdict containing blocking finding");
+    } finally {
+      if (prevClaude) process.env.TRIRELAY_CLAUDE_BIN = prevClaude;
+      else delete process.env.TRIRELAY_CLAUDE_BIN;
+    }
+  }
+
+  // R16: swarm and teamwork reject fan-out profile ('boost-trio') BEFORE dispatching earlier sibling workers
+  {
+    const beforeR16Lines = fs.existsSync(RECORD_FILE) ? fs.readFileSync(RECORD_FILE, "utf8").split("\n").filter(Boolean).length : 0;
+    await assert.rejects(
+      () =>
+        runOrchestration(REPO_DIR, {
+          pattern: "swarm",
+          host: "agy",
+          workers: [
+            { name: "ok-worker", engine: "claude", model: "haiku", mode: "readonly", prompt: "say ok" },
+            { name: "bad-profile", profile: "boost-trio", mode: "readonly", prompt: "fail preflight" }
+          ]
+        }),
+      /fan-out profile/i
+    );
+    await assert.rejects(
+      () =>
+        runOrchestration(REPO_DIR, {
+          pattern: "teamwork",
+          host: "agy",
+          tasks: [
+            { role: "ok-task", engine: "claude", model: "haiku", mode: "readonly", prompt: "say ok" },
+            { role: "bad-profile", profile: "boost-trio", mode: "readonly", prompt: "fail preflight" }
+          ]
+        }),
+      /fan-out profile/i
+    );
+    const afterR16Lines = fs.existsSync(RECORD_FILE) ? fs.readFileSync(RECORD_FILE, "utf8").split("\n").filter(Boolean).length : 0;
+    assert.equal(afterR16Lines, beforeR16Lines, "Fan-out profile sibling must reject before starting earlier workers");
+  }
+
+  // R17-R19 over MCP launched in NON_GIT_DIR targeting REPO_DIR:
+  // R17: relay_jobs(wait, waitTimeoutMs=90000) exits fast on stdin EOF after job finishes
+  // R18: compacted relay_review & inspect include cwd=REPO_DIR in _recall and nextRecall
+  // R19: relay_board seqs precedes pinsOnly and recallHint omits pinsOnly=true
+  {
+    const mcpR17 = spawn(process.execPath, [path.join(PACKAGE_ROOT, "bin", "trirelay-mcp.mjs")], {
+      cwd: NON_GIT_DIR,
+      env: { ...process.env, TRIRELAY_TEST_MANY_FINDINGS: "12" },
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    let rBuf = "";
+    const rMap = new Map();
+    mcpR17.stdout.setEncoding("utf8");
+    mcpR17.stdout.on("data", (chunk) => {
+      rBuf += chunk;
+      let idx = rBuf.indexOf("\n");
+      while (idx !== -1) {
+        const line = rBuf.slice(0, idx).trim();
+        rBuf = rBuf.slice(idx + 1);
+        if (line) {
+          const msg = JSON.parse(line);
+          if (msg.id !== undefined) rMap.set(msg.id, msg);
+        }
+        idx = rBuf.indexOf("\n");
+      }
+    });
+    const sendR = (m) => mcpR17.stdin.write(`${JSON.stringify(m)}\n`);
+    const waitR = async (id, timeoutMs = 15000) => {
+      const t0 = Date.now();
+      while (!rMap.has(id)) {
+        if (Date.now() - t0 > timeoutMs) throw new Error(`MCP R17-19 timeout id=${id}`);
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      return rMap.get(id);
+    };
+
+    try {
+      sendR({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } });
+      await waitR(1);
+
+      // R18: cross-workspace compacted review _recall + nextRecall preserve cwd
+      sendR({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "relay_review", arguments: { cwd: REPO_DIR, engine: "claude" } }
+      });
+      const revAlt = JSON.parse((await waitR(2)).result.content[0].text);
+      assert.equal(revAlt._compacted, true);
+      assert.ok(revAlt._recall.includes(REPO_DIR), `Expected _recall to preserve alternate cwd: ${revAlt._recall}`);
+      sendR({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: "relay_review", arguments: { cwd: REPO_DIR, action: "inspect", reviewId: revAlt.reviewId, offset: 0, limit: 6 } }
+      });
+      const inspAlt = JSON.parse((await waitR(3)).result.content[0].text);
+      assert.equal(inspAlt.findings.length, 6);
+      assert.ok(inspAlt.nextRecall.includes(REPO_DIR), `Expected nextRecall to preserve alternate cwd: ${inspAlt.nextRecall}`);
+
+      // R19: board seqs takes precedence over pinsOnly even after pin retires
+      const r19Board = `r19-retired-seq-${Date.now()}`;
+      const p1 = postBoardMessage(REPO_DIR, r19Board, { author: "a", tag: "[pin]", pinId: "p-retire", text: "PIN_TO_RETIRE" });
+      postBoardMessage(REPO_DIR, r19Board, { author: "a", tag: "[resolve]", supersedes: "p-retire", text: "Retired pin" });
+      sendR({
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: { name: "relay_board", arguments: { cwd: REPO_DIR, boardId: r19Board, action: "read", pinsOnly: true, seqs: [p1.seq] } }
+      });
+      const seqRead = JSON.parse((await waitR(4)).result.content[0].text);
+      assert.equal(seqRead.view, "seqs");
+      assert.equal(seqRead.posts.length, 1);
+      assert.equal(seqRead.posts[0].seq, p1.seq);
+
+      // R17: fast background job + waitTimeoutMs=90000 must NOT hold MCP alive after stdin EOF
+      sendR({
+        jsonrpc: "2.0",
+        id: 5,
+        method: "tools/call",
+        params: { name: "relay_run", arguments: { cwd: REPO_DIR, host: "agy", engine: "claude", background: true, prompt: "fast ok" } }
+      });
+      const bgStart = JSON.parse((await waitR(5)).result.content[0].text);
+      sendR({
+        jsonrpc: "2.0",
+        id: 6,
+        method: "tools/call",
+        params: { name: "relay_jobs", arguments: { cwd: REPO_DIR, action: "wait", jobId: bgStart.jobId, waitTimeoutMs: 90000 } }
+      });
+      await waitR(6);
+      const exitWait = new Promise((resolve) => mcpR17.once("exit", (code) => resolve(code)));
+      const eofStart = Date.now();
+      mcpR17.stdin.end();
+      await Promise.race([
+        exitWait,
+        new Promise((_, rej) => setTimeout(() => rej(new Error("MCP hung on stdin EOF due to leaked waitTimeoutMs timer")), 3000))
+      ]);
+      assert.ok(Date.now() - eofStart < 3000, "MCP must exit promptly after EOF without waiting 90s");
+    } finally {
+      try { mcpR17.kill("SIGKILL"); } catch {}
+    }
+  }
+
+  console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables, R8-R19 sweep/repair/fanout/audit-hardening)");
 }
 
 async function main() {
