@@ -279,6 +279,7 @@ async function main() {
         base: options.base || null,
         model: options.model || null,
         effort: options.effort || undefined,
+        timeoutMs: options.timeout ? Number(options.timeout) : undefined,
         native: Boolean(options.native),
         focus: positionals.join(" ")
       });

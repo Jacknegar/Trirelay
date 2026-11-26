@@ -316,6 +316,33 @@ export function captureWorktreeChanges(repoRoot, worktreePath, worktreeId, baseS
   };
 }
 
+function decodeGitCQuotedPath(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  if (!(s.startsWith('"') && s.endsWith('"'))) return s;
+  const inner = s.slice(1, -1);
+  const bytes = [];
+  for (let i = 0; i < inner.length; i += 1) {
+    if (inner[i] === "\\" && i + 1 < inner.length) {
+      const next = inner[i + 1];
+      if (/[0-7]{3}/.test(inner.slice(i + 1, i + 4))) {
+        bytes.push(Number.parseInt(inner.slice(i + 1, i + 4), 8));
+        i += 3;
+        continue;
+      }
+      const escMap = { a: 7, b: 8, f: 12, n: 10, r: 13, t: 9, v: 11, "\\": 92, '"': 34 };
+      if (escMap[next] !== undefined) {
+        bytes.push(escMap[next]);
+        i += 1;
+        continue;
+      }
+    }
+    const chBytes = Buffer.from(inner[i], "utf8");
+    for (const b of chBytes) bytes.push(b);
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
 export function extractPatchTouchedFiles(patchInput, repoRoot = process.cwd()) {
   const patchBuf = Buffer.isBuffer(patchInput) ? patchInput : Buffer.from(String(patchInput || ""), "utf8");
   if (patchBuf.length === 0) {
@@ -348,6 +375,31 @@ export function extractPatchTouchedFiles(patchInput, repoRoot = process.cwd()) {
       touched.add(rest);
     }
   }
+
+  // Also capture rename/copy source & destination ONLY inside extended diff headers
+  // (before `@@ ` / `GIT binary patch`) because Git 2.25.1 `--numstat -z` emits only destination.
+  let inDiffHeader = false;
+  for (const line of patchBuf.toString("utf8").split(/\r?\n/)) {
+    if (line.startsWith("diff --git ")) {
+      inDiffHeader = true;
+      continue;
+    }
+    if (!inDiffHeader) continue;
+    if (line.startsWith("@@ ") || line.startsWith("GIT binary patch") || line.startsWith("--- ") || line.startsWith("+++ ")) {
+      if (line.startsWith("@@ ") || line.startsWith("GIT binary patch")) {
+        inDiffHeader = false;
+      }
+      continue;
+    }
+    if (line.startsWith("rename from ") || line.startsWith("copy from ")) {
+      const src = decodeGitCQuotedPath(line.slice(line.indexOf("from ") + 5));
+      if (src) touched.add(src);
+    } else if (line.startsWith("rename to ") || line.startsWith("copy to ")) {
+      const dst = decodeGitCQuotedPath(line.slice(line.indexOf("to ") + 3));
+      if (dst) touched.add(dst);
+    }
+  }
+
   return [...touched].filter(Boolean);
 }
 

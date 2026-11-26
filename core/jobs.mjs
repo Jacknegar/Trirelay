@@ -216,19 +216,21 @@ export async function handleJobControl(cwd, args = {}) {
 }
 
 export async function cancelAllActiveInProcessJobs(graceMs = 2500) {
-  const activeBg = [...activeInProcessJobs.values()];
-  const activeFg = [...activeForegroundOps.values()];
-  const allActive = [...activeBg, ...activeFg];
-  if (allActive.length === 0) return;
-  for (const item of allActive) {
-    try {
-      item.controller.abort();
-    } catch {
-      // Ignore abort errors.
+  const deadline = Date.now() + Math.max(100, Number(graceMs) || 2500);
+  while (Date.now() < deadline) {
+    const allActive = [...activeInProcessJobs.values(), ...activeForegroundOps.values()];
+    if (allActive.length === 0) break;
+    for (const item of allActive) {
+      try {
+        item.controller.abort();
+      } catch {
+        // Ignore abort errors.
+      }
     }
+    const remaining = Math.max(20, deadline - Date.now());
+    await Promise.race([
+      Promise.allSettled(allActive.map((a) => a.promise)),
+      new Promise((r) => setTimeout(r, Math.min(250, remaining)))
+    ]);
   }
-  await Promise.race([
-    Promise.allSettled(allActive.map((a) => a.promise)),
-    new Promise((r) => setTimeout(r, graceMs))
-  ]);
 }

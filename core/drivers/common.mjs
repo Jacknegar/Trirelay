@@ -80,6 +80,7 @@ export function spawnJsonlProcess({
     let stderr = "";
     let stdinError = null;
     let processExited = false;
+    let pipesClosed = false;
     let exitCode = null;
     let timedOut = false;
     let aborted = false;
@@ -88,6 +89,7 @@ export function spawnJsonlProcess({
     let settled = false;
     let forceKillTimer = null;
     let exitDrainTimer = null;
+    let groupPollTimer = null;
     let finalSettleTimer = null;
 
     function isProcessGroupAlive(pid) {
@@ -114,6 +116,10 @@ export function spawnJsonlProcess({
       if (exitDrainTimer) {
         clearTimeout(exitDrainTimer);
         exitDrainTimer = null;
+      }
+      if (groupPollTimer) {
+        clearInterval(groupPollTimer);
+        groupPollTimer = null;
       }
       if (!preserveForceKill && forceKillTimer) {
         clearTimeout(forceKillTimer);
@@ -166,6 +172,16 @@ export function spawnJsonlProcess({
         }
       } catch {
         // Ignore ESRCH when process/group already exited.
+      }
+
+      if (useProcessGroup && proc.pid && !groupPollTimer) {
+        groupPollTimer = setInterval(() => {
+          if (settled) return;
+          if ((terminating || processExited) && !isProcessGroupAlive(proc.pid)) {
+            destroyStreams();
+            finalize(exitCode);
+          }
+        }, 50);
       }
 
       if (!forceKillTimer) {
@@ -234,9 +250,25 @@ export function spawnJsonlProcess({
       onStderr?.(chunk);
     });
 
+    function maybeSettleCleanExit(code = exitCode) {
+      if (!processExited || !pipesClosed || settled) return;
+      if ((terminating || sweepingGroup) && useProcessGroup && proc.pid && forceKillTimer && isProcessGroupAlive(proc.pid)) {
+        return;
+      }
+      if (!terminating && !sweepingGroup && useProcessGroup && proc.pid && isProcessGroupAlive(proc.pid)) {
+        terminateTree({ markTerminating: false });
+        return;
+      }
+      finalize(code ?? exitCode);
+    }
+
     proc.on("exit", (code) => {
       processExited = true;
       exitCode = code;
+      if (pipesClosed) {
+        maybeSettleCleanExit(code);
+        return;
+      }
       // If a CLI exits cleanly while orphaned descendants still hold stdout/stderr open,
       // drain briefly then sweep the process group so we settle with the real exit code instead of hanging.
       if (!terminating && !settled && !exitDrainTimer) {
@@ -265,12 +297,8 @@ export function spawnJsonlProcess({
     });
 
     proc.on("close", (code) => {
-      // Do NOT cancel SIGKILL escalation simply because pipes closed after the leader exited
-      // if grandchildren in the detached process group are still alive.
-      if ((terminating || sweepingGroup) && useProcessGroup && proc.pid && forceKillTimer && isProcessGroupAlive(proc.pid)) {
-        return;
-      }
-      finalize(code ?? exitCode);
+      pipesClosed = true;
+      maybeSettleCleanExit(code ?? exitCode);
     });
 
     if (stdinText !== null && proc.stdin) {

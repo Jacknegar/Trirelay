@@ -1062,6 +1062,16 @@ export async function runDualReview(cwd, params = {}, internalOpts = {}) {
     .filter(Boolean)
     .join("\n");
 
+  const fanoutController = new AbortController();
+  const forwardAbort = () => fanoutController.abort();
+  if (signal) {
+    if (signal.aborted) {
+      fanoutController.abort();
+    } else {
+      signal.addEventListener("abort", forwardAbort, { once: true });
+    }
+  }
+
   const tasks = targetEngines.map((eng) => {
     const perEngineModel =
       eng === "codex"
@@ -1085,15 +1095,25 @@ export async function runDualReview(cwd, params = {}, internalOpts = {}) {
         timeoutMs: params.timeoutMs,
         workflowId: params.workflowId || "review"
       },
-      { signal }
+      { signal: fanoutController.signal }
     );
   });
 
   if (tasks.length === 0) {
+    if (signal) signal.removeEventListener("abort", forwardAbort);
     throw new Error("No reviewer engines selected.");
   }
 
-  const results = await Promise.all(tasks);
+  let results;
+  try {
+    results = await Promise.all(tasks);
+  } catch (err) {
+    fanoutController.abort();
+    await Promise.allSettled(tasks);
+    throw err;
+  } finally {
+    if (signal) signal.removeEventListener("abort", forwardAbort);
+  }
   const allSucceededWithSchema = results.every((r) => r.ok && isValidReviewPayload(r.structuredOutput));
 
   const findingsLists = results.map((r) => normalizeFindings(r.structuredOutput?.findings, r.engine));
@@ -1188,6 +1208,7 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
       cycleId: null,
       status: "passed",
       round: 0,
+      nextAttemptSeq: 0,
       pendingReservations: [],
       history: [],
       completedCycles: []
@@ -1195,8 +1216,8 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
     return { ok: true, gateKey, reset: true, round: 0 };
   }
 
-  // Reserve an in-flight token atomically BEFORE executing review without prematurely
-  // counting pending work as completed rounds. A passed cycle automatically starts a fresh cycle.
+  // Reserve an in-flight token with a monotonic cycle attempt sequence BEFORE executing review.
+  // Pending work never counts as completed rounds, and concurrent completions retain dispatch order.
   const reservationToken = generateId("res");
   const reservation = withReviewGateLock(workspaceRoot, gateKey, (state, save) => {
     const livePending = (Array.isArray(state.pendingReservations) ? state.pendingReservations : []).filter(
@@ -1216,24 +1237,27 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
       }
       const nextCycleNum = (state.cycleNumber || 0) + 1;
       const nextCycleId = generateId("cyc");
-      const entry = { token: reservationToken, round: 1, pid: process.pid, startedAt: nowIso() };
+      const seq = 1;
+      const entry = { token: reservationToken, seq, round: 1, pid: process.pid, startedAt: nowIso() };
       save({
         gateKey,
         cycleNumber: nextCycleNum,
         cycleId: nextCycleId,
         status: "open",
         round: 0,
+        nextAttemptSeq: seq,
         pendingReservations: [entry],
         history: [],
         completedCycles: completedCycles.slice(-10)
       });
-      return { escalated: false, inProgress: false, round: 1, cycleId: nextCycleId, cycleNumber: nextCycleNum };
+      return { escalated: false, inProgress: false, seq, round: 1, cycleId: nextCycleId, cycleNumber: nextCycleNum };
     }
 
     const historyArr = Array.isArray(state.history) ? state.history : [];
     const completedCounted = historyArr.filter((h) => h.counted !== false).length;
     if (completedCounted >= maxRounds) {
-      const lastEntry = [...historyArr].reverse().find((h) => h.counted !== false) ?? historyArr.at(-1) ?? {};
+      const sortedHistory = [...historyArr].sort((a, b) => (a.seq ?? a.round ?? 0) - (b.seq ?? b.round ?? 0));
+      const lastEntry = [...sortedHistory].reverse().find((h) => h.counted !== false) ?? sortedHistory.at(-1) ?? {};
       const remainingBlocking = (lastEntry.findings ?? []).filter((f) => isBlockingSeverity(f.severity));
       save({ ...state, status: "escalated", round: completedCounted, pendingReservations: livePending });
       return { escalated: true, inProgress: false, state: { ...state, round: completedCounted }, lastEntry, remainingBlocking };
@@ -1250,15 +1274,17 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
     }
 
     const nextRound = completedCounted + livePending.length + 1;
-    const entry = { token: reservationToken, round: nextRound, pid: process.pid, startedAt: nowIso() };
+    const seq = Math.max(Number(state.nextAttemptSeq || 0), historyArr.reduce((m, h) => Math.max(m, Number(h.seq || h.round || 0)), 0)) + 1;
+    const entry = { token: reservationToken, seq, round: nextRound, pid: process.pid, startedAt: nowIso() };
     save({
       ...state,
       gateKey,
       status: "open",
       round: completedCounted,
+      nextAttemptSeq: seq,
       pendingReservations: [...livePending, entry]
     });
-    return { escalated: false, inProgress: false, round: nextRound, cycleId: state.cycleId, cycleNumber: state.cycleNumber || 1 };
+    return { escalated: false, inProgress: false, seq, round: nextRound, cycleId: state.cycleId, cycleNumber: state.cycleNumber || 1 };
   });
 
   if (reservation.escalated) {
@@ -1295,6 +1321,12 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
   }
 
   let review;
+  let tokenRetired = false;
+  let staleCompletion = false;
+  let blockingFindings = [];
+  let advisoryFindings = [];
+  let decision = "incomplete";
+
   try {
     review = await runDualReview(
       workspaceRoot,
@@ -1305,76 +1337,85 @@ export async function runReviewGate(cwd, params = {}, internalOpts = {}) {
           gateKey,
           cycleId: reservation.cycleId,
           cycleNumber: reservation.cycleNumber,
+          seq: reservation.seq,
           round: reservation.round,
           maxRounds
         }
       },
       internalOpts
     );
-  } catch (err) {
+
+    blockingFindings = review.findings.filter((f) => isBlockingSeverity(f.severity));
+    advisoryFindings = review.findings.filter((f) => !isBlockingSeverity(f.severity));
+    decision = !review.ok
+      ? "incomplete"
+      : blockingFindings.length > 0 || review.verdict === "needs-attention"
+        ? "fix_required"
+        : "pass";
+
     withReviewGateLock(workspaceRoot, gateKey, (latest, save) => {
       const remainingPending = (Array.isArray(latest.pendingReservations) ? latest.pendingReservations : []).filter(
         (p) => p && p.token !== reservationToken && isPidLive(p.pid)
       );
-      save({ ...latest, pendingReservations: remainingPending });
-    });
-    throw err;
-  }
 
-  const blockingFindings = review.findings.filter((f) => isBlockingSeverity(f.severity));
-  const advisoryFindings = review.findings.filter((f) => !isBlockingSeverity(f.severity));
-  const decision = !review.ok
-    ? "incomplete"
-    : blockingFindings.length > 0 || review.verdict === "needs-attention"
-      ? "fix_required"
-      : "pass";
-
-  let staleCompletion = false;
-  withReviewGateLock(workspaceRoot, gateKey, (latest, save) => {
-    const remainingPending = (Array.isArray(latest.pendingReservations) ? latest.pendingReservations : []).filter(
-      (p) => p && p.token !== reservationToken && isPidLive(p.pid)
-    );
-
-    // Compare-and-set on cycleId: ignore stale late completions if a newer cycle
-    // started or if the target cycle has already passed.
-    if (latest.cycleId !== reservation.cycleId || latest.status === "passed") {
-      save({ ...latest, pendingReservations: remainingPending });
-      staleCompletion = true;
-      return;
-    }
-
-    const rawHistory = [
-      ...(latest.history ?? []),
-      {
-        round: reservation.round,
-        reviewId: review.reviewId,
-        artifactPath: review.artifactPath ?? null,
-        artifactDigest: review.artifactDigest,
-        timestamp: nowIso(),
-        decision,
-        counted: decision !== "incomplete",
-        verdict: review.verdict,
-        effort: review.effort,
-        findings: review.findings
+      // Compare-and-set on cycleId: ignore stale late completions if a newer cycle
+      // started or if the target cycle has already passed.
+      if (latest.cycleId !== reservation.cycleId || latest.status === "passed") {
+        save({ ...latest, pendingReservations: remainingPending });
+        staleCompletion = true;
+        tokenRetired = true;
+        return;
       }
-    ].sort((a, b) => (a.round ?? 0) - (b.round ?? 0));
 
-    // Keep all counted rounds plus at most the 10 most recent incomplete attempts.
-    const countedEntries = rawHistory.filter((h) => h.counted !== false);
-    const incompleteEntries = rawHistory.filter((h) => h.counted === false).slice(-10);
-    const history = [...countedEntries, ...incompleteEntries].sort((a, b) => (a.round ?? 0) - (b.round ?? 0));
+      const rawHistory = [
+        ...(latest.history ?? []),
+        {
+          seq: reservation.seq,
+          round: reservation.round,
+          reviewId: review.reviewId,
+          artifactPath: review.artifactPath ?? null,
+          artifactDigest: review.artifactDigest,
+          timestamp: nowIso(),
+          decision,
+          counted: decision !== "incomplete",
+          verdict: review.verdict,
+          effort: review.effort,
+          findings: review.findings
+        }
+      ].sort((a, b) => (a.seq ?? a.round ?? 0) - (b.seq ?? b.round ?? 0));
 
-    save({
-      gateKey,
-      cycleId: reservation.cycleId,
-      cycleNumber: reservation.cycleNumber,
-      status: decision === "pass" ? "passed" : "open",
-      round: countedEntries.length,
-      pendingReservations: remainingPending,
-      history,
-      completedCycles: latest.completedCycles ?? []
+      // Keep all counted rounds plus at most the 10 most recent incomplete attempts.
+      const countedEntries = rawHistory.filter((h) => h.counted !== false);
+      const incompleteEntries = rawHistory.filter((h) => h.counted === false).slice(-10);
+      const history = [...countedEntries, ...incompleteEntries].sort((a, b) => (a.seq ?? a.round ?? 0) - (b.seq ?? b.round ?? 0));
+
+      save({
+        gateKey,
+        cycleId: reservation.cycleId,
+        cycleNumber: reservation.cycleNumber,
+        status: decision === "pass" ? "passed" : "open",
+        round: countedEntries.length,
+        nextAttemptSeq: Math.max(Number(latest.nextAttemptSeq || 0), reservation.seq),
+        pendingReservations: remainingPending,
+        history,
+        completedCycles: latest.completedCycles ?? []
+      });
+      tokenRetired = true;
     });
-  });
+  } finally {
+    if (!tokenRetired) {
+      try {
+        withReviewGateLock(workspaceRoot, gateKey, (latest, save) => {
+          const remainingPending = (Array.isArray(latest.pendingReservations) ? latest.pendingReservations : []).filter(
+            (p) => p && p.token !== reservationToken && isPidLive(p.pid)
+          );
+          save({ ...latest, pendingReservations: remainingPending });
+        });
+      } catch {
+        // Best-effort token retirement on lock failure; PID liveness check backs it up.
+      }
+    }
+  }
 
   return {
     ok: decision === "pass" && !staleCompletion,
@@ -1634,8 +1675,20 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
         ? params.models
         : resolveRoute({ profile: "boost-trio", host, excludeHost: false }).fanout.map((f) => f.spec);
 
-    const phase1Results = await Promise.all(
-      modelSpecs.map((spec, idx) => {
+    const boostController = new AbortController();
+    const forwardBoostAbort = () => boostController.abort();
+    if (signal) {
+      if (signal.aborted) {
+        boostController.abort();
+      } else {
+        signal.addEventListener("abort", forwardBoostAbort, { once: true });
+      }
+    }
+
+    let phase1Results = [];
+    let critiques = [];
+    try {
+      const phase1Promises = modelSpecs.map((spec, idx) => {
         const route = resolveRoute({ spec, host });
         return pool.run(route.primary.engine, () =>
           runSingleTask(
@@ -1656,16 +1709,20 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
                 `\nProblem:\n${question}`
               ].join("\n")
             },
-            { signal }
+            { signal: boostController.signal }
           )
         );
-      })
-    );
+      });
+      try {
+        phase1Results = await Promise.all(phase1Promises);
+      } catch (err) {
+        boostController.abort();
+        await Promise.allSettled(phase1Promises);
+        throw err;
+      }
 
-    let critiques = [];
-    if (!signal?.aborted && params.crossCritique && phase1Results.length >= 2) {
-      critiques = await Promise.all(
-        phase1Results.map((own, idx) => {
+      if (!boostController.signal.aborted && params.crossCritique && phase1Results.length >= 2) {
+        const critiquePromises = phase1Results.map((own, idx) => {
           const peers = phase1Results
             .filter((_, j) => j !== idx)
             .map(
@@ -1697,11 +1754,20 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
                   .filter(Boolean)
                   .join("\n")
               },
-              { signal }
+              { signal: boostController.signal }
             )
           );
-        })
-      );
+        });
+        try {
+          critiques = await Promise.all(critiquePromises);
+        } catch (err) {
+          boostController.abort();
+          await Promise.allSettled(critiquePromises);
+          throw err;
+        }
+      }
+    } finally {
+      if (signal) signal.removeEventListener("abort", forwardBoostAbort);
     }
 
     return {

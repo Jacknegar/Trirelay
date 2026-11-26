@@ -230,8 +230,11 @@ export function lookupSessionById(cwd, { engine, sessionId }) {
     return indexed;
   }
   const matches = Object.values(ledger.entries ?? {})
-    .filter((entry) => entry.engine === engine && entry.sessionId === sessionId)
-    .sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
+    .filter((entry) => entry && entry.engine === engine && entry.sessionId === sessionId)
+    .sort((a, b) => {
+      const hwDiff = (b.hadWorktree ? 1 : 0) - (a.hadWorktree ? 1 : 0);
+      return hwDiff !== 0 ? hwDiff : String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? ""));
+    });
   return matches[0] ?? null;
 }
 
@@ -489,6 +492,19 @@ function applyPinTransition(pins, record) {
   return next;
 }
 
+function computeTailHashAt(filePath, offset) {
+  if (!offset || offset <= 0) return null;
+  const edgeBytes = Math.min(512, offset);
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const buf = Buffer.alloc(edgeBytes);
+    const n = fs.readSync(fd, buf, 0, edgeBytes, offset - edgeBytes);
+    return createHash("sha256").update(buf.subarray(0, n)).digest("hex").slice(0, 16);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function computeFileEdgeHashes(filePath, size) {
   if (!size || size <= 0) {
     return { headHash: null, tailHash: null };
@@ -514,6 +530,7 @@ function repairBoardTailLocked(boardFile) {
   const st = fs.statSync(boardFile);
   if (st.size === 0) return;
 
+  let closed = false;
   const fd = fs.openSync(boardFile, "r");
   try {
     const lastByte = Buffer.alloc(1);
@@ -521,33 +538,48 @@ function repairBoardTailLocked(boardFile) {
     if (lastByte[0] === 0x0a) {
       return;
     }
-    // Unterminated tail: read trailing window, keep complete JSON if valid else truncate torn fragment.
-    const scanLen = Math.min(st.size, 65536);
-    const scanOffset = st.size - scanLen;
-    const tailBuf = Buffer.alloc(scanLen);
-    const n = fs.readSync(fd, tailBuf, 0, scanLen, scanOffset);
-    const slice = tailBuf.subarray(0, n);
-    const lastNl = slice.lastIndexOf(0x0a);
-    const fragOffset = lastNl === -1 ? scanOffset : scanOffset + lastNl + 1;
-    const fragText = slice.subarray(lastNl + 1).toString("utf8").trim();
+    // Unterminated tail: walk backward in 64 KiB chunks until the true preceding `\n`
+    // (or offset 0) so oversized >64 KiB torn records never leave partial fragments behind.
+    const CHUNK = 65536;
+    const chunkBuf = Buffer.alloc(CHUNK);
+    let cursor = st.size;
+    let fragOffset = 0;
+    while (cursor > 0) {
+      const start = Math.max(0, cursor - CHUNK);
+      const len = cursor - start;
+      const n = fs.readSync(fd, chunkBuf, 0, len, start);
+      const idx = chunkBuf.subarray(0, n).lastIndexOf(0x0a);
+      if (idx !== -1) {
+        fragOffset = start + idx + 1;
+        break;
+      }
+      cursor = start;
+    }
+
+    const fragLen = st.size - fragOffset;
+    const fragBuf = Buffer.alloc(fragLen);
+    const fRead = fragLen > 0 ? fs.readSync(fd, fragBuf, 0, fragLen, fragOffset) : 0;
+    const fragText = fragBuf.subarray(0, fRead).toString("utf8").trim();
+    fs.closeSync(fd);
+    closed = true;
+
     if (fragText) {
       try {
         JSON.parse(fragText);
-        fs.closeSync(fd);
         fs.appendFileSync(boardFile, "\n", "utf8");
         return;
       } catch {
-        // Fall through and truncate incomplete JSON line.
+        // Fall through and truncate incomplete JSON line back to true boundary.
       }
     }
-    fs.closeSync(fd);
     fs.truncateSync(boardFile, fragOffset);
-    return;
   } finally {
-    try {
-      fs.closeSync(fd);
-    } catch {
-      // Already closed on repair path.
+    if (!closed) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close errors.
+      }
     }
   }
 }
@@ -604,38 +636,42 @@ export function readActiveBoardPins(cwd, boardId = "default") {
       return data.pins.filter((p) => p.status === "active");
     }
     if (data.logSize >= 0 && data.logSize < st.size) {
-      const deltaSize = st.size - data.logSize;
-      const fd = fs.openSync(boardFile, "r");
-      let tailText = "";
-      try {
-        const buf = Buffer.alloc(deltaSize);
-        const bytesRead = fs.readSync(fd, buf, 0, deltaSize, data.logSize);
-        tailText = buf.slice(0, bytesRead).toString("utf8");
-      } finally {
-        fs.closeSync(fd);
-      }
-      if (tailText.endsWith("\n")) {
-        let pins = data.pins.map((p) => ({ ...p }));
-        let parseOk = true;
-        let sawPinChange = false;
-        for (const line of tailText.split(/\r?\n/).filter(Boolean)) {
-          try {
-            const rec = JSON.parse(line);
-            if (isPinTag(rec.tag) || isRetireTag(rec.tag) || rec.supersedes !== undefined) {
-              sawPinChange = true;
-            }
-            pins = applyPinTransition(pins, rec);
-          } catch {
-            parseOk = false;
-            break;
-          }
+      const boundaryTailOk =
+        data.logSize === 0 || (Boolean(data.tailHash) && computeTailHashAt(boardFile, data.logSize) === data.tailHash);
+      if (boundaryTailOk) {
+        const deltaSize = st.size - data.logSize;
+        const fd = fs.openSync(boardFile, "r");
+        let tailText = "";
+        try {
+          const buf = Buffer.alloc(deltaSize);
+          const bytesRead = fs.readSync(fd, buf, 0, deltaSize, data.logSize);
+          tailText = buf.slice(0, bytesRead).toString("utf8");
+        } finally {
+          fs.closeSync(fd);
         }
-        if (parseOk) {
-          if (sawPinChange || deltaSize > 8192) {
-            const reconciled = withFileLockSync(boardFile, () => rebuildPinsFromBoardLocked(boardFile, pinsFile, boardId));
-            return reconciled.filter((p) => p.status === "active");
+        if (tailText.endsWith("\n")) {
+          let pins = data.pins.map((p) => ({ ...p }));
+          let parseOk = true;
+          let sawPinChange = false;
+          for (const line of tailText.split(/\r?\n/).filter(Boolean)) {
+            try {
+              const rec = JSON.parse(line);
+              if (isPinTag(rec.tag) || isRetireTag(rec.tag) || rec.supersedes !== undefined) {
+                sawPinChange = true;
+              }
+              pins = applyPinTransition(pins, rec);
+            } catch {
+              parseOk = false;
+              break;
+            }
           }
-          return pins.filter((p) => p.status === "active");
+          if (parseOk) {
+            if (sawPinChange || deltaSize > 8192) {
+              const reconciled = withFileLockSync(boardFile, () => rebuildPinsFromBoardLocked(boardFile, pinsFile, boardId));
+              return reconciled.filter((p) => p.status === "active");
+            }
+            return pins.filter((p) => p.status === "active");
+          }
         }
       }
     }
@@ -728,21 +764,21 @@ export function postBoardMessage(cwd, boardId = "default", entry = {}) {
       ...(entry.model ? { model: entry.model } : {})
     };
     const oldSize = fs.existsSync(file) ? fs.statSync(file).size : 0;
-    const prevHeadHash = oldSize > 0 ? computeFileEdgeHashes(file, oldSize).headHash : null;
+    const prevEdge = oldSize > 0 ? computeFileEdgeHashes(file, oldSize) : { headHash: null, tailHash: null };
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     fs.appendFileSync(file, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
     const newSize = fs.statSync(file).size;
     const { headHash, tailHash } = computeFileEdgeHashes(file, newSize);
 
     // Keep dedicated active pins index watermark-aligned atomically under the board lock,
-    // advancing the watermark on ordinary updates too so later pin posts don't force a full replay.
+    // advancing the watermark on ordinary updates too ONLY when old size + headHash + tailHash match.
     const existingIndex = fs.existsSync(pinsFile) ? readJsonSafe(pinsFile, null) : null;
     const needsPinUpdate = isPinTag(record.tag) || isRetireTag(record.tag) || record.supersedes !== undefined;
     const indexAligned =
       existingIndex &&
       Array.isArray(existingIndex.pins) &&
       existingIndex.logSize === oldSize &&
-      (!prevHeadHash || existingIndex.headHash === prevHeadHash);
+      (!prevEdge.headHash || (existingIndex.headHash === prevEdge.headHash && existingIndex.tailHash === prevEdge.tailHash));
 
     if (indexAligned) {
       const updatedPins = needsPinUpdate ? applyPinTransition(existingIndex.pins, record) : existingIndex.pins;
@@ -755,7 +791,7 @@ export function postBoardMessage(cwd, boardId = "default", entry = {}) {
         updatedAt: nowIso(),
         pins: updatedPins
       });
-    } else if (needsPinUpdate || !existingIndex) {
+    } else {
       rebuildPinsFromBoardLocked(file, pinsFile, safeBoardId);
     }
     return record;

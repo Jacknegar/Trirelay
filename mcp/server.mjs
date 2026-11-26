@@ -44,6 +44,7 @@ import { applyJobPatch } from "../core/worktree.mjs";
 const PACKAGE_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const PKG = readJsonSafe(path.join(PACKAGE_ROOT, "package.json"), { version: "1.0.0" });
 const SUPPORTED_PROTOCOL_VERSIONS = ["2025-03-26", "2024-11-05"];
+let serverShuttingDown = false;
 
 const TOOLS = [
   {
@@ -646,6 +647,10 @@ async function handleRequest(msg) {
   if (id === undefined || id === null) {
     return;
   }
+  if (serverShuttingDown) {
+    sendError(id, -32000, "MCP server is shutting down.");
+    return;
+  }
 
   try {
     if (method === "initialize") {
@@ -719,6 +724,12 @@ export function startMcpServer() {
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   let shutdownPromise = null;
   const shutdown = async (exitOnFinish = false) => {
+    serverShuttingDown = true;
+    try {
+      rl.close();
+    } catch {
+      // Ignore close failure.
+    }
     if (!shutdownPromise) {
       shutdownPromise = cancelAllActiveInProcessJobs(2500).catch(() => {});
     }

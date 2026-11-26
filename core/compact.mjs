@@ -519,6 +519,28 @@ function buildMinimalSummary(toolName, payload, originalBytes, maxBytes) {
   return { _compacted: true };
 }
 
+function decorateCompactedMetadata(target, toolName, payload, originalBytes, preview1) {
+  const view = unwrapJobPayload(payload);
+  target._compacted = true;
+  target._originalBytes = originalBytes;
+  target._recall = buildRecallPointer(toolName, payload);
+  if (view && view !== payload) {
+    if (view.reviewId && target.reviewId === undefined) target.reviewId = view.reviewId;
+    if (view.decision && target.decision === undefined) target.decision = view.decision;
+    if (view.verdict && target.verdict === undefined) target.verdict = view.verdict;
+    if (view.blockingCount != null && target.blockingCount === undefined) target.blockingCount = view.blockingCount;
+    if (view.totalFindings != null && target.totalFindings === undefined) target.totalFindings = view.totalFindings;
+    if (view.deliverableMode && target.deliverableMode === undefined) target.deliverableMode = view.deliverableMode;
+    if (typeof view.ignoredOnlyDeliverables === "boolean" && target.ignoredOnlyDeliverables === undefined) {
+      target.ignoredOnlyDeliverables = view.ignoredOnlyDeliverables;
+    }
+  }
+  if (preview1.length > 0 && target.blockingPreview === undefined) {
+    target.blockingPreview = preview1;
+  }
+  return target;
+}
+
 export function compactMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxBytes(), enabled = true } = {}) {
   if (!enabled || payload == null || typeof payload !== "object") {
     return payload;
@@ -530,35 +552,40 @@ export function compactMcpPayload(toolName, payload, { maxBytes = resolveMcpMaxB
     return payload;
   }
 
-  // Pass 1: truncate bulky text fields (~700 bytes each), preserving findings/metadata.
-  const pass1 = shrinkBulkyStrings(cloneJson(payload), Math.min(700, Math.floor(budget * 0.25)), false);
-  pass1._compacted = true;
-  pass1._originalBytes = originalBytes;
-  pass1._recall = buildRecallPointer(toolName, payload);
   const preview1 = buildBlockingPreview(payload, 5);
-  if (preview1.length > 0 && pass1.blockingPreview === undefined) {
-    pass1.blockingPreview = preview1;
-  }
+  const isWrappedJobResult = Boolean(payload?.job?.result && typeof payload.job.result === "object");
+
+  // Pass 1: truncate bulky text fields (~700 bytes each), preserving findings/metadata.
+  const pass1 = decorateCompactedMetadata(
+    shrinkBulkyStrings(cloneJson(payload), Math.min(700, Math.floor(budget * 0.25)), false),
+    toolName,
+    payload,
+    originalBytes,
+    preview1
+  );
   if (Buffer.byteLength(JSON.stringify(pass1), "utf8") <= budget) {
     return pass1;
   }
 
   // Pass 2: aggressive string cap (~200 bytes) and strip duplicate per-worker structuredOutput.
-  const pass2 = shrinkBulkyStrings(cloneJson(payload), Math.min(200, Math.floor(budget * 0.1)), true);
+  const pass2 = decorateCompactedMetadata(
+    shrinkBulkyStrings(cloneJson(payload), Math.min(200, Math.floor(budget * 0.1)), true),
+    toolName,
+    payload,
+    originalBytes,
+    preview1
+  );
   if (Array.isArray(pass2.posts) && pass2.posts.length > 6) {
     pass2.posts = buildTieredBoardView(pass2.posts, { recentFull: 2, maxBytes: Math.floor(budget * 0.45) }).posts;
   }
-  pass2._compacted = true;
-  pass2._originalBytes = originalBytes;
-  pass2._recall = buildRecallPointer(toolName, payload);
-  if (preview1.length > 0 && pass2.blockingPreview === undefined) {
-    const withPreview = { ...pass2, blockingPreview: preview1 };
-    if (Buffer.byteLength(JSON.stringify(withPreview), "utf8") <= budget) {
-      return withPreview;
-    }
-  }
   if (Buffer.byteLength(JSON.stringify(pass2), "utf8") <= budget) {
     return pass2;
+  }
+  if (preview1.length > 0 && !isWrappedJobResult && "blockingPreview" in pass2) {
+    delete pass2.blockingPreview;
+    if (Buffer.byteLength(JSON.stringify(pass2), "utf8") <= budget) {
+      return pass2;
+    }
   }
 
   // Pass 3: guaranteed-bounded summary preserving reviewId, blockingPreview & exact recall pointer.

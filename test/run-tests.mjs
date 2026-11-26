@@ -855,6 +855,16 @@ async function testReleaseGateStateConsistencySuite() {
     () => applyJobPatch(REPO_DIR, { ...r1Turn1, status: "completed", patchSha256: null }, { mode: "apply" }),
     /without patchSha256/i
   );
+  // Advisory B1: Rename patch extracts BOTH source and destination regardless of Git version
+  const renamePatch = [
+    "diff --git a/docs/handoff.md b/src/renamed-out.txt",
+    "similarity index 100%",
+    "rename from docs/handoff.md",
+    "rename to src/renamed-out.txt",
+    ""
+  ].join("\n");
+  const renTouched = extractPatchTouchedFiles(renamePatch, REPO_DIR);
+  assert.ok(renTouched.includes("docs/handoff.md") && renTouched.includes("src/renamed-out.txt"));
 
   // B2: Fresh session under same (workflow, role, engine) does not inherit prior patch/worktree,
   // old sessionId stays in lookup, cross-role readonly keeps write binding, and live-PID lease never expires early.
@@ -933,7 +943,21 @@ async function testReleaseGateStateConsistencySuite() {
     hadWorktree: true,
     updatedAt: "2026-01-01T00:00:00.000Z"
   };
+  legacyLedger.entries["wf-leg::reviewer::codex"] = {
+    workflowId: "wf-leg",
+    role: "reviewer",
+    engine: "codex",
+    sessionId: "sess-b2-legacy",
+    sessionCwd: REPO_DIR,
+    hadWorktree: false,
+    updatedAt: "2026-02-01T00:00:00.000Z"
+  };
   writeJsonAtomic(ledgerFileB2, legacyLedger);
+  assert.equal(
+    lookupSessionById(REPO_DIR, { engine: "codex", sessionId: "sess-b2-legacy" })?.hadWorktree,
+    true,
+    "Legacy lookupSessionById must prefer hadWorktree=true over newer readonly entry"
+  );
   recordRoleSession(REPO_DIR, {
     workflowId: "wf-leg-2",
     role: "reviewer",
@@ -1247,6 +1271,33 @@ async function testReleaseGateStateConsistencySuite() {
   }
   assert.equal(sibAlive, false, `Expected drain sweep SIGKILL to terminate redirected sibling pid=${sibPid}`);
 
+  // Round 3 B6: Clean exit where leader spawns ONLY stdio:'ignore' SIGTERM-ignoring descendant -> close probes group & kills descendant before resolving!
+  const cleanChildPidFile = path.join(TMP_BASE, "b6-clean-ign.pid");
+  const cleanIgnScript =
+    "const fs = require('node:fs'); const { spawn } = require('node:child_process'); " +
+    `const d = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: 'ignore' }); ` +
+    `fs.writeFileSync(${JSON.stringify(cleanChildPidFile)}, String(d.pid)); ` +
+    "process.exit(0);";
+  const cleanSweepRes = await spawnJsonlProcess({
+    bin: process.execPath,
+    args: ["-e", cleanIgnScript],
+    cwd: REPO_DIR,
+    engine: "codex",
+    stdinText: null,
+    timeoutMs: 30000,
+    killGraceMs: 200
+  });
+  assert.equal(cleanSweepRes.code, 0);
+  assert.equal(cleanSweepRes.timedOut, false);
+  const cleanDescPid = Number(fs.readFileSync(cleanChildPidFile, "utf8").trim());
+  let cleanDescAlive = true;
+  try {
+    process.kill(cleanDescPid, 0);
+  } catch (e) {
+    if (e.code === "ESRCH") cleanDescAlive = false;
+  }
+  assert.equal(cleanDescAlive, false, `Clean exit close probe must sweep surviving descendant pid=${cleanDescPid}`);
+
   // R5 (P2 #5): Long 520B pin preserved intact; pin at #1 survives 205 updates; pinsOnly/seqs/supersedes work cleanly
   const r5BoardId = `pins-r5-${Date.now()}`;
   const longPinTail = "END_INVARIANT_MUST_SURVIVE_520B";
@@ -1310,13 +1361,22 @@ async function testReleaseGateStateConsistencySuite() {
   const b7Active = readActiveBoardPins(REPO_DIR, b7Board);
   assert.equal(b7Active.length, 2);
   assert.ok(b7Active.some((p) => p.text === "SURVIVING_PIN"), "Torn JSONL tail must be repaired before appending next pin");
-  // Replace last byte inside tailHash window preserving exact byte length -> headHash/tailHash catches tampering
+  // Replace last byte inside tailHash window preserving exact byte length -> headHash/tailHash catches tampering on read AND update!
   const origBuf = fs.readFileSync(b7BoardFile);
   const sameLenBuf = Buffer.from(origBuf);
   const idxSurv = sameLenBuf.indexOf("SURVIVING_PIN");
   sameLenBuf[idxSurv] = "X".charCodeAt(0);
   fs.writeFileSync(b7BoardFile, sameLenBuf);
-  assert.ok(readActiveBoardPins(REPO_DIR, b7Board).some((p) => p.text === "XURVIVING_PIN"), "Same-size tail mutation must invalidate cache via tailHash");
+  postBoardMessage(REPO_DIR, b7Board, { author: "worker", tag: "[update]", text: "UPDATE_AFTER_MUTATE" });
+  assert.ok(readActiveBoardPins(REPO_DIR, b7Board).some((p) => p.text === "XURVIVING_PIN"), "Same-size tail mutation must invalidate cache via tailHash even after [update]");
+
+  // Round 3 B7: Torn fragment > 64 KiB truncates completely back to real preceding newline
+  const preOversizedSize = fs.statSync(b7BoardFile).size;
+  fs.appendFileSync(b7BoardFile, `{"seq":888,"text":"${"A".repeat(72 * 1024)}"`, "utf8");
+  postBoardMessage(REPO_DIR, b7Board, { author: "arch", tag: "[decision]", pinId: "b7-p3", text: "AFTER_BIG_TEAR" });
+  const postRepairSize = fs.statSync(b7BoardFile).size;
+  assert.ok(postRepairSize < preOversizedSize + 1024, `Oversized >64KiB torn fragment must be truncated completely (size=${postRepairSize})`);
+  assert.ok(readActiveBoardPins(REPO_DIR, b7Board).some((p) => p.text === "AFTER_BIG_TEAR"));
 
   // Round 2 B5: Concurrent maxRounds=1 returns in_progress (never premature escalate_to_user); review artifact write-once throws on overwrite & persists decision; timeoutMs forwarded
   const concGate = `cycle-conc-${Date.now()}`;
@@ -1337,6 +1397,26 @@ async function testReleaseGateStateConsistencySuite() {
   const gateTimeout = await runReviewGate(REPO_DIR, { gateKey: `gate-to-${Date.now()}`, engine: "claude", timeoutMs: 120 });
   delete process.env.TRIRELAY_TEST_DELAY_MS;
   assert.equal(gateTimeout.decision, "incomplete", "review-gate timeoutMs must propagate to review workers");
+
+  // Round 3 B5: Monotonic attempt seq prevents duplicate round collision when incomplete precedes out-of-order counted completions
+  const seqGate = `cycle-seq-${Date.now()}`;
+  process.env.TRIRELAY_TEST_CLAUDE_FAIL = "1";
+  const attA = await runReviewGate(REPO_DIR, { gateKey: seqGate, engine: "claude", maxRounds: 2 });
+  assert.equal(attA.decision, "incomplete");
+  delete process.env.TRIRELAY_TEST_CLAUDE_FAIL;
+  process.env.TRIRELAY_TEST_REVIEW_BLOCKING = "1";
+  process.env.TRIRELAY_TEST_DELAY_MS = "900";
+  const attB = runReviewGate(REPO_DIR, { gateKey: seqGate, engine: "claude", maxRounds: 2 });
+  await new Promise((r) => setTimeout(r, 120));
+  delete process.env.TRIRELAY_TEST_DELAY_MS;
+  const attC = await runReviewGate(REPO_DIR, { gateKey: seqGate, engine: "claude", maxRounds: 2 });
+  const attBDone = await attB;
+  delete process.env.TRIRELAY_TEST_REVIEW_BLOCKING;
+  assert.equal(attC.decision, "fix_required");
+  assert.equal(attBDone.decision, "fix_required");
+  const escSeq = await runReviewGate(REPO_DIR, { gateKey: seqGate, engine: "claude", maxRounds: 2 });
+  assert.equal(escSeq.decision, "escalate_to_user");
+  assert.equal(escSeq.reviewId, attC.reviewId, "Escalation must cite chronologically newer attempt C instead of slower earlier attempt B");
 
   // B5: Stale late review-gate completion cannot reopen passed cycle or corrupt newer cycle; incomplete does not consume round
   fs.writeFileSync(path.join(REPO_DIR, "src", "auth.js"), "export function login() { return true; }\n");
@@ -1592,6 +1672,34 @@ async function testReleaseGateStateConsistencySuite() {
     assert.equal(bgEscCompacted.decision, "escalate_to_user");
     assert.equal(bgEscCompacted.blockingCount, 12);
     assert.ok(Array.isArray(bgEscCompacted.blockingPreview) && bgEscCompacted.blockingPreview.length > 0);
+
+    // Advisory B4: Background relay_jobs(result) with 11 oversized findings at default 8500B cap ALWAYS keeps blockingPreview!
+    const bgEsc11Compacted = JSON.parse(serializeMcpPayload("relay_jobs", {
+      job: {
+        id: "job-bg-esc-11",
+        status: "failed",
+        result: {
+          ok: false,
+          reviewId: round2.reviewId,
+          decision: "escalate_to_user",
+          blockingCount: 11,
+          totalFindings: 11,
+          remainingBlockingFindings: Array.from({ length: 11 }, (_, idx) => ({
+            id: `F${idx + 1}`,
+            severity: "blocking",
+            file: `src/f${idx}.js`,
+            line_start: 10 + idx,
+            title: `BgBlocker11 ${idx + 1}`,
+            trigger_path: `Path ${idx + 1}`,
+            body: "Detailed background gate escalation body ".repeat(25)
+          }))
+        }
+      },
+      logTail: "noise"
+    }, { maxBytes: 8500 }).text);
+    assert.equal(bgEsc11Compacted.reviewId, round2.reviewId);
+    assert.equal(bgEsc11Compacted.blockingCount, 11);
+    assert.ok(Array.isArray(bgEsc11Compacted.blockingPreview) && bgEsc11Compacted.blockingPreview.length > 0);
 
     // Check full board view bypasses 100-post window
     send({
