@@ -2420,7 +2420,57 @@ async function testReleaseGateStateConsistencySuite() {
     }
   }
 
-  console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables, R8-R23 audit hardening)");
+  // R24: Fallback engine swap inside runSingleTask respects destination engine's maxConcurrentPerEngine cap (<=2)
+  {
+    const r24ActiveDir = path.join(TMP_BASE, "r24-active");
+    const r24PeakLog = path.join(TMP_BASE, "r24-peak.log");
+    fs.mkdirSync(r24ActiveDir, { recursive: true });
+    const fakeClaudeCap = path.join(TMP_BASE, "fake-claude-cap");
+    fs.writeFileSync(
+      fakeClaudeCap,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "const path = require('node:path');",
+        `const activeDir = ${JSON.stringify(r24ActiveDir)};`,
+        `const peakLog = ${JSON.stringify(r24PeakLog)};`,
+        "const marker = path.join(activeDir, `${process.pid}-${Date.now()}-${Math.random()}`);",
+        "fs.writeFileSync(marker, '1');",
+        "const count = fs.readdirSync(activeDir).length;",
+        "fs.appendFileSync(peakLog, `${count}\\n`);",
+        "setTimeout(() => {",
+        "  try { fs.unlinkSync(marker); } catch {}",
+        "  console.log(JSON.stringify({ type: 'result', subtype: 'success', session_id: `cap-${process.pid}`, result: 'CAP_OK' }));",
+        "}, 250);"
+      ].join("\n"),
+      { mode: 0o755 }
+    );
+    const prevClaudeR24 = process.env.TRIRELAY_CLAUDE_BIN;
+    const prevCodexR24 = process.env.TRIRELAY_CODEX_BIN;
+    process.env.TRIRELAY_CLAUDE_BIN = fakeClaudeCap;
+    process.env.TRIRELAY_CODEX_BIN = path.join(TMP_BASE, "fake-codex-429");
+    try {
+      const capBoost = await runOrchestration(REPO_DIR, {
+        pattern: "boost",
+        host: "agy",
+        prompt: "Analyze consistency risk",
+        models: ["claude:haiku", "claude:haiku", ""]
+      });
+      assert.equal(capBoost.ok, true);
+      assert.equal(capBoost.perspectives.length, 3);
+      assert.ok(capBoost.perspectives.every((p) => p.engine === "claude"));
+      const counts = fs.readFileSync(r24PeakLog, "utf8").trim().split(/\r?\n/).map(Number);
+      assert.equal(counts.length, 3);
+      assert.ok(Math.max(...counts) <= 2, `Claude concurrency cap exceeded during Codex->Claude fallback: ${counts.join(",")}`);
+    } finally {
+      if (prevClaudeR24 !== undefined) process.env.TRIRELAY_CLAUDE_BIN = prevClaudeR24;
+      else delete process.env.TRIRELAY_CLAUDE_BIN;
+      if (prevCodexR24 !== undefined) process.env.TRIRELAY_CODEX_BIN = prevCodexR24;
+      else delete process.env.TRIRELAY_CODEX_BIN;
+    }
+  }
+
+  console.log("[PASS] Release-gate state-consistency suite (R1 bind/replay/fail-closed, R2 inheritance, R3 review inspect, R4 EPIPE+orphan timeout, R5 active pins, R6 cycle reset, R7 ignored deliverables, R8-R24 audit hardening)");
 }
 
 async function main() {

@@ -153,8 +153,11 @@ class ConcurrencyPool {
     this.waiters = [];
   }
 
-  async run(engine, fn) {
-    await this.acquire(engine);
+  async run(engine, fn, { signal = null } = {}) {
+    const acquired = await this.acquire(engine, signal);
+    if (!acquired) {
+      return null;
+    }
     try {
       return await fn();
     } finally {
@@ -162,14 +165,28 @@ class ConcurrencyPool {
     }
   }
 
-  acquire(engine) {
+  acquire(engine, signal = null) {
+    if (signal?.aborted) {
+      return Promise.resolve(false);
+    }
     if (this.canRun(engine)) {
       this.activeGlobal += 1;
       this.activeByEngine[engine] = (this.activeByEngine[engine] ?? 0) + 1;
-      return Promise.resolve();
+      return Promise.resolve(true);
     }
     return new Promise((resolve) => {
-      this.waiters.push({ engine, resolve });
+      const waiter = { engine, resolve, signal, onAbort: null };
+      if (signal) {
+        waiter.onAbort = () => {
+          const idx = this.waiters.indexOf(waiter);
+          if (idx !== -1) {
+            this.waiters.splice(idx, 1);
+          }
+          resolve(false);
+        };
+        signal.addEventListener("abort", waiter.onAbort, { once: true });
+      }
+      this.waiters.push(waiter);
     });
   }
 
@@ -184,9 +201,12 @@ class ConcurrencyPool {
       const waiter = this.waiters[i];
       if (this.canRun(waiter.engine)) {
         this.waiters.splice(i, 1);
+        if (waiter.signal && waiter.onAbort) {
+          waiter.signal.removeEventListener("abort", waiter.onAbort);
+        }
         this.activeGlobal += 1;
         this.activeByEngine[waiter.engine] = (this.activeByEngine[waiter.engine] ?? 0) + 1;
-        waiter.resolve();
+        waiter.resolve(true);
         return;
       }
     }
@@ -251,6 +271,7 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
   validateCallerArgs(params);
 
   const signal = internalOpts.signal ?? null;
+  const pool = internalOpts.pool ?? null;
   if (signal?.aborted) {
     return {
       ok: false,
@@ -547,20 +568,26 @@ export async function runSingleTask(cwd, params = {}, internalOpts = {}) {
       const target = candidates[i];
       usedTarget = target;
       appendJobLog(logFile, `Attempt ${i + 1}: ${target.engine}:${target.model ?? "default"}@${target.effort ?? "default"}`);
-      const res = await executeWithEngine(target, {
-        cwd: effectiveCwd,
-        prompt: fullPrompt,
-        mode,
-        resumeSessionId: i === 0 ? resumeSessionId : null,
-        forkSession: Boolean(params.forkSession),
-        outputSchema: params.outputSchema ?? null,
-        appendSystemPrompt: params.appendSystemPrompt ?? null,
-        fallbackModel: params.fallbackModel ?? null,
-        maxBudgetUsd: params.maxBudgetUsd ?? null,
-        timeoutMs: params.timeoutMs ?? 600000,
-        signal,
-        onProgress
-      });
+      const runAttempt = () =>
+        executeWithEngine(target, {
+          cwd: effectiveCwd,
+          prompt: fullPrompt,
+          mode,
+          resumeSessionId: i === 0 ? resumeSessionId : null,
+          forkSession: Boolean(params.forkSession),
+          outputSchema: params.outputSchema ?? null,
+          appendSystemPrompt: params.appendSystemPrompt ?? null,
+          fallbackModel: params.fallbackModel ?? null,
+          maxBudgetUsd: params.maxBudgetUsd ?? null,
+          timeoutMs: params.timeoutMs ?? 600000,
+          signal,
+          onProgress
+        });
+      const res = pool ? await pool.run(target.engine, runAttempt, { signal }) : await runAttempt();
+      if (!res) {
+        finalResult = null;
+        break;
+      }
 
       attempts.push({
         engine: target.engine,
@@ -1722,23 +1749,21 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
         return { spec, idx, route };
       });
       const phase1Promises = resolvedPhase1.map(({ spec, idx, route }) =>
-        pool.run(route.primary.engine, () =>
-          runSingleTask(
-            workspaceRoot,
-            {
-              workflowId,
-              boardId,
-              host,
-              role: `boost-${idx + 1}-${route.primary.engine}`,
-              spec,
-              mode: "readonly",
-              timeoutMs: params.timeoutMs,
-              includeHostDigest: Boolean(params.includeHostDigest || params.includeAgyDigest),
-              includeRepoHandoff: Boolean(params.includeRepoHandoff),
-              prompt: phase1Prompt
-            },
-            { signal: boostController.signal }
-          )
+        runSingleTask(
+          workspaceRoot,
+          {
+            workflowId,
+            boardId,
+            host,
+            role: `boost-${idx + 1}-${route.primary.engine}`,
+            spec,
+            mode: "readonly",
+            timeoutMs: params.timeoutMs,
+            includeHostDigest: Boolean(params.includeHostDigest || params.includeAgyDigest),
+            includeRepoHandoff: Boolean(params.includeRepoHandoff),
+            prompt: phase1Prompt
+          },
+          { signal: boostController.signal, pool }
         )
       );
       try {
@@ -1760,30 +1785,28 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
             .join("\n\n");
           const spec = `${own.engine}${own.model ? `:${own.model}` : ""}${own.effort ? `@${own.effort}` : ""}`;
           const canFork = own.engine === "claude" || own.engine === "codex";
-          return pool.run(own.engine, () =>
-            runSingleTask(
-              workspaceRoot,
-              {
-                workflowId,
-                boardId,
-                host,
-                role: `critique-${idx + 1}-${own.engine}`,
-                spec,
-                mode: "readonly",
-                timeoutMs: params.timeoutMs,
-                resumeSessionId: canFork ? own.sessionId : null,
-                forkSession: canFork,
-                prompt: [
-                  "Cross-critique round: inspect the peer perspectives below against your own analysis.",
-                  "Identify: (1) flaws or blind spots in peer reasoning, (2) points where a peer caught something you missed, (3) your revised concise verdict.",
-                  !canFork && own.output ? `\nYour Phase 1 Analysis:\n${own.output.slice(0, 2500)}` : "",
-                  `\n${peers}`
-                ]
-                  .filter(Boolean)
-                  .join("\n")
-              },
-              { signal: boostController.signal }
-            )
+          return runSingleTask(
+            workspaceRoot,
+            {
+              workflowId,
+              boardId,
+              host,
+              role: `critique-${idx + 1}-${own.engine}`,
+              spec,
+              mode: "readonly",
+              timeoutMs: params.timeoutMs,
+              resumeSessionId: canFork ? own.sessionId : null,
+              forkSession: canFork,
+              prompt: [
+                "Cross-critique round: inspect the peer perspectives below against your own analysis.",
+                "Identify: (1) flaws or blind spots in peer reasoning, (2) points where a peer caught something you missed, (3) your revised concise verdict.",
+                !canFork && own.output ? `\nYour Phase 1 Analysis:\n${own.output.slice(0, 2500)}` : "",
+                `\n${peers}`
+              ]
+                .filter(Boolean)
+                .join("\n")
+            },
+            { signal: boostController.signal, pool }
           );
         });
         try {
@@ -2025,30 +2048,28 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
             });
             return blockedResult;
           }
-          return pool.run(item.route.primary.engine, () =>
-            runSingleTask(
-              workspaceRoot,
-              {
-                workflowId,
-                boardId,
-                host,
-                role: item.name,
-                profile: item.profile,
-                spec: item.w.spec,
-                engine: item.w.engine,
-                model: item.w.model,
-                effort: item.w.effort,
-                mode: item.mode,
-                ownedFiles: item.w.ownedFiles ?? [],
-                forbiddenFiles: item.w.forbiddenFiles ?? ["docs/handoff.md"],
-                evidence: item.depEvidence,
-                invariants: item.w.invariants ?? [],
-                acceptanceCriteria: item.w.acceptanceCriteria ?? [],
-                handoff: true,
-                prompt: item.w.prompt
-              },
-              { signal: swarmController.signal }
-            )
+          return runSingleTask(
+            workspaceRoot,
+            {
+              workflowId,
+              boardId,
+              host,
+              role: item.name,
+              profile: item.profile,
+              spec: item.w.spec,
+              engine: item.w.engine,
+              model: item.w.model,
+              effort: item.w.effort,
+              mode: item.mode,
+              ownedFiles: item.w.ownedFiles ?? [],
+              forbiddenFiles: item.w.forbiddenFiles ?? ["docs/handoff.md"],
+              evidence: item.depEvidence,
+              invariants: item.w.invariants ?? [],
+              acceptanceCriteria: item.w.acceptanceCriteria ?? [],
+              handoff: true,
+              prompt: item.w.prompt
+            },
+            { signal: swarmController.signal, pool }
           );
         });
 
@@ -2199,31 +2220,29 @@ export async function runOrchestration(cwd, params = {}, internalOpts = {}) {
   let workerResults = [];
   let verificationResult = null;
   try {
-    const workerPromises = preparedTasks.map(({ task, role, mode, profile, route }) =>
-      pool.run(route.primary.engine, () =>
-        runSingleTask(
-          workspaceRoot,
-          {
-            workflowId,
-            boardId,
-            host,
-            role,
-            profile,
-            spec: task.spec,
-            engine: task.engine,
-            model: task.model,
-            effort: task.effort,
-            mode,
-            ownedFiles: task.ownedFiles ?? [],
-            forbiddenFiles: task.forbiddenFiles ?? ["docs/handoff.md"],
-            invariants: task.invariants ?? [],
-            acceptanceCriteria: task.acceptanceCriteria ?? [],
-            handoff: true,
-            outputSchema: task.outputSchema ?? WORKER_SCHEMA,
-            prompt: task.prompt
-          },
-          { signal: teamController.signal }
-        )
+    const workerPromises = preparedTasks.map(({ task, role, mode, profile }) =>
+      runSingleTask(
+        workspaceRoot,
+        {
+          workflowId,
+          boardId,
+          host,
+          role,
+          profile,
+          spec: task.spec,
+          engine: task.engine,
+          model: task.model,
+          effort: task.effort,
+          mode,
+          ownedFiles: task.ownedFiles ?? [],
+          forbiddenFiles: task.forbiddenFiles ?? ["docs/handoff.md"],
+          invariants: task.invariants ?? [],
+          acceptanceCriteria: task.acceptanceCriteria ?? [],
+          handoff: true,
+          outputSchema: task.outputSchema ?? WORKER_SCHEMA,
+          prompt: task.prompt
+        },
+        { signal: teamController.signal, pool }
       )
     );
 
